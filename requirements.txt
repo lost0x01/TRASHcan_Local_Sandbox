@@ -1,0 +1,9 @@
+# Core runner uses the Python standard library plus host CLI tools.
+#
+# Optional Python packages:
+#   python-evtx  Parse Sysmon EVTX artifacts into JSON samples.
+#   pytest       Alternative test runner; unittest works without it.
+
+python-evtx>=0.7.4
+pytest>=8.2.0
+

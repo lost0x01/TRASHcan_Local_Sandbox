@@ -1,0 +1,18 @@
+vm:
+  name: win-malware-lab
+  snapshot: clean-guestadditions-sysmon
+  guest_user: analyst
+  guest_password: MalwareLab!2026
+
+network:
+  interface: vboxnet0
+  host_ip: 192.168.56.1
+  guest_ip: 192.168.56.20
+
+run:
+  duration: 180
+  password: infected
+  stop_apache: true
+  suricata: true
+  memory_dump: false
+
