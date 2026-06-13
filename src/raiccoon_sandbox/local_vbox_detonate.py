@@ -2,13 +2,14 @@
 """
 Local VirtualBox malware detonation runner.
 
-This is the REMnux-lite path for the local RAIccoon lab:
-  - restore/start the host-only Windows VM
+This is the REMnux + Windows path for the local RAIccoon lab:
+  - restore/start the host-only Windows VM for detonation
+  - stage run artifacts into REMnux for static/network artifact analysis
   - provide wildcard DNS on the host-only gateway
   - provide fake HTTP/HTTPS services
   - capture vboxnet0 with tshark
   - detonate via mounted ISO and keyboard injection
-  - parse PCAP/DNS IOCs
+  - parse PCAP/DNS/static artifacts via REMnux when configured
   - power off and restore the clean snapshot
 """
 
@@ -22,6 +23,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -40,13 +42,21 @@ import xml.etree.ElementTree as ET
 DEFAULT_VM = "win-malware-lab"
 DEFAULT_SNAPSHOT = "clean-guestadditions-sysmon"
 DEFAULT_INTERFACE = "vboxnet0"
-DEFAULT_HOST_IP = "192.168.56.1"
+DEFAULT_HOST_IP = "192.168.56.254"
 DEFAULT_GUEST_IP = "192.168.56.20"
 DEFAULT_PASSWORD = "infected"
 DEFAULT_GUEST_USER = "analyst"
 DEFAULT_GUEST_PASSWORD = "MalwareLab!2026"
 DEFAULT_RUN_ROOT = Path("/home/lost0x01/obsidian/05 Security Research/Malware Analysis/Runs")
+DEFAULT_ANALYSIS_VM = "remnux"
+DEFAULT_ANALYSIS_VM_USER = "remnux"
+DEFAULT_ANALYSIS_VM_PASSWORD = "malware"
+DEFAULT_ANALYSIS_SHARE_HOST = Path("/home/lost0x01/vm-shares/remnux-transfer")
+DEFAULT_ANALYSIS_SHARE_GUEST = "/media/sf_remnux_transfer"
+DEFAULT_ANALYSIS_SERVICE_IP = "192.168.56.1"
+DEFAULT_ANALYSIS_INTERFACE = "enp0s3"
 DEFAULT_HTTP_BODY_LIMIT = 1024 * 1024
+PRIVILEGED_HELPER_PATH = Path(os.getenv("TRASHCAN_PRIV_HELPER", "/usr/local/libexec/trashcan/trashcan-net-helper.py"))
 
 
 IOC_PATTERNS = {
@@ -160,6 +170,10 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def privileged_helper_cmd(*args: str) -> list[str]:
+    return ["sudo", "-n", str(PRIVILEGED_HELPER_PATH), *args]
+
+
 def start(cmd: list[str], log_path: Path, *, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.Popen:
     log = log_path.open("ab")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=cwd, env=env, start_new_session=True)
@@ -213,30 +227,42 @@ def find_interface_capture_pids(interface: str) -> list[str]:
 
 
 def preflight(args: argparse.Namespace, run_dir: Path | None = None) -> dict[str, object]:
-    required = ["VBoxManage", "tshark", "capinfos", "7z", "dnsmasq", "xorriso"]
+    required = ["VBoxManage", "7z", "xorriso"]
+    if not analysis_vm_enabled(args):
+        required.extend(["tshark", "capinfos", "dnsmasq"])
     missing = [name for name in required if not command_exists(name)]
     if missing:
         raise RuntimeError(f"Missing required host tools: {', '.join(missing)}")
-    if args.suricata and not command_exists("suricata"):
+    if args.suricata and not analysis_vm_enabled(args) and not command_exists("suricata"):
         raise RuntimeError("Suricata was requested but is not installed")
 
     snapshot_list = run(["VBoxManage", "snapshot", args.vm, "list", "--machinereadable"], check=False).stdout
     if args.snapshot not in snapshot_list:
         raise RuntimeError(f"Snapshot '{args.snapshot}' was not found on VM '{args.vm}'")
-
-    busy_ports = [p for p in (53, 80, 443, 8080) if not port_is_free(args.host_ip, p)]
-    stale_capture_pids = find_interface_capture_pids(args.interface)
-    if stale_capture_pids and args.kill_stale_capture:
-        for pid in stale_capture_pids:
-            run(["sudo", "-n", "kill", "-TERM", pid], check=False)
-        time.sleep(1)
+    if analysis_vm_enabled(args):
+        analysis_vm_info = run(["VBoxManage", "showvminfo", args.analysis_vm, "--machinereadable"], check=False)
+        if analysis_vm_info.returncode != 0:
+            raise RuntimeError(f"Analysis VM '{args.analysis_vm}' was not found")
+        args.analysis_share_host.expanduser().resolve().mkdir(parents=True, exist_ok=True)
+        busy_ports: list[int] = []
+        stale_capture_pids: list[str] = []
+    else:
+        busy_ports = [p for p in (53, 80, 443, 8080) if not port_is_free(args.host_ip, p)]
         stale_capture_pids = find_interface_capture_pids(args.interface)
+        if stale_capture_pids and args.kill_stale_capture:
+            for pid in stale_capture_pids:
+                run(["sudo", "-n", "kill", "-TERM", pid], check=False)
+            time.sleep(1)
+            stale_capture_pids = find_interface_capture_pids(args.interface)
     details = {
         "ts": dt.datetime.now(dt.UTC).isoformat(),
         "vm": args.vm,
         "snapshot": args.snapshot,
         "interface": args.interface,
         "host_ip": args.host_ip,
+        "analysis_vm": args.analysis_vm if analysis_vm_enabled(args) else "",
+        "analysis_service_ip": args.analysis_service_ip if analysis_vm_enabled(args) else "",
+        "analysis_interface": args.analysis_interface if analysis_vm_enabled(args) else "",
         "busy_ports_before_host_conflict_stop": busy_ports,
         "stale_capture_pids": stale_capture_pids,
         "suricata_available": command_exists("suricata"),
@@ -268,14 +294,14 @@ def stop_host_conflicts(run_dir: Path, stop_apache: bool) -> dict[str, bool]:
     state = {"apache2_was_active": False}
     if stop_apache and service_is_active("apache2"):
         state["apache2_was_active"] = True
-        out = run(["sudo", "-n", "systemctl", "stop", "apache2"], check=False).stdout
+        out = run(privileged_helper_cmd("apache", "stop"), check=False).stdout
         (run_dir / "host_services.log").write_text(f"Stopped apache2 before run:\n{out}\n", encoding="utf-8")
     return state
 
 
 def restore_host_conflicts(state: dict[str, bool], run_dir: Path | None) -> None:
     if state.get("apache2_was_active"):
-        out = run(["sudo", "-n", "systemctl", "start", "apache2"], check=False).stdout
+        out = run(privileged_helper_cmd("apache", "start"), check=False).stdout
         if run_dir:
             with (run_dir / "host_services.log").open("a", encoding="utf-8") as fh:
                 fh.write(f"\nRestored apache2 after run:\n{out}\n")
@@ -491,65 +517,51 @@ def serve_http(host_ip: str, port: int, log_path: Path, cert_pair: tuple[Path, P
 def start_fake_services(args: argparse.Namespace, run_dir: Path) -> list[subprocess.Popen]:
     procs: list[subprocess.Popen] = []
     dns_log = run_dir / "dnsmasq.log"
-    dns_hosts = run_dir / "dnsmasq.hosts"
-    dns_hosts.write_text(f"address=/#/{args.host_ip}\n", encoding="ascii")
-    dns_cmd = [
-        "sudo", "-n", "dnsmasq",
-        "--no-daemon",
-        "--keep-in-foreground",
-        "--no-resolv",
-        "--log-queries",
-        "--log-facility=-",
-        f"--interface={args.interface}",
-        f"--listen-address={args.host_ip}",
-        "--bind-interfaces",
-        f"--conf-file={dns_hosts}",
-    ]
+    dns_cmd = privileged_helper_cmd("dnsmasq", "--interface", args.interface, "--host-ip", args.host_ip)
     procs.append(start(dns_cmd, dns_log))
     time.sleep(1)
     if procs[-1].poll() is not None:
         raise RuntimeError(f"dnsmasq failed to start; see {dns_log}")
 
-    env = os.environ.copy()
-    env["RAICCOON_SCRIPT"] = str(Path(__file__).resolve())
-    http_code = (
-        "import importlib.util, os; "
-        "p=os.environ['RAICCOON_SCRIPT']; "
-        "s=importlib.util.spec_from_file_location('runner', p); "
-        "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
-        "m.serve_http(os.environ['HOST_IP'], int(os.environ['PORT']), "
-        "m.Path(os.environ['LOG_PATH']), None)"
-    )
     for port in (80, 8080):
-        env2 = env | {"HOST_IP": args.host_ip, "PORT": str(port), "LOG_PATH": str(run_dir / f"http_{port}.jsonl")}
-        cmd = ["sudo", "-n", "env"] + [f"{k}={v}" for k, v in env2.items() if k in {"RAICCOON_SCRIPT", "HOST_IP", "PORT", "LOG_PATH"}]
-        cmd += [sys.executable, "-u", "-c", http_code]
-        procs.append(start(cmd, run_dir / f"http_{port}.log"))
+        log_json = run_dir / f"http_{port}.jsonl"
+        if port < 1024:
+            cmd = privileged_helper_cmd(
+                "http",
+                "--host-ip", args.host_ip,
+                "--port", str(port),
+                "--log-path", str(log_json),
+            )
+            procs.append(start(cmd, run_dir / f"http_{port}.log"))
+        else:
+            procs.append(
+                start(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        (
+                            "import importlib.util; "
+                            f"p={str(Path(__file__).resolve())!r}; "
+                            "s=importlib.util.spec_from_file_location('runner', p); "
+                            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                            f"m.serve_http({args.host_ip!r}, {port}, m.Path({str(log_json)!r}), None)"
+                        ),
+                    ],
+                    run_dir / f"http_{port}.log",
+                )
+            )
 
     cert_pair = make_tls_cert(run_dir)
     if cert_pair:
-        https_code = (
-            "import importlib.util, os; "
-            "p=os.environ['RAICCOON_SCRIPT']; "
-            "s=importlib.util.spec_from_file_location('runner', p); "
-            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
-            "m.serve_http(os.environ['HOST_IP'], int(os.environ['PORT']), "
-            "m.Path(os.environ['LOG_PATH']), "
-            "(m.Path(os.environ['CERT']), m.Path(os.environ['KEY'])))"
+        cmd = privileged_helper_cmd(
+            "http",
+            "--host-ip", args.host_ip,
+            "--port", "443",
+            "--log-path", str(run_dir / "https_443.jsonl"),
+            "--cert", str(cert_pair[0]),
+            "--key", str(cert_pair[1]),
         )
-        env2 = env | {
-            "HOST_IP": args.host_ip,
-            "PORT": "443",
-            "LOG_PATH": str(run_dir / "https_443.jsonl"),
-            "CERT": str(cert_pair[0]),
-            "KEY": str(cert_pair[1]),
-        }
-        cmd = ["sudo", "-n", "env"] + [
-            f"{k}={v}"
-            for k, v in env2.items()
-            if k in {"RAICCOON_SCRIPT", "HOST_IP", "PORT", "LOG_PATH", "CERT", "KEY"}
-        ]
-        cmd += [sys.executable, "-u", "-c", https_code]
         procs.append(start(cmd, run_dir / "https_443.log"))
     time.sleep(1)
     return procs
@@ -574,12 +586,14 @@ def start_suricata(args: argparse.Namespace, run_dir: Path) -> subprocess.Popen 
         ]),
         encoding="ascii",
     )
-    cmd = [
-        "sudo", "-n", "suricata", "-i", args.interface,
-        "-l", str(log_dir), "-s", str(rules),
-        "--set", f"outputs.1.eve-log.filename={eve}",
-    ]
-    validation = run(["sudo", "-n", "suricata", "-T", "-s", str(rules)], check=False)
+    cmd = privileged_helper_cmd(
+        "suricata-run",
+        "--interface", args.interface,
+        "--log-dir", str(log_dir),
+        "--rules", str(rules),
+        "--eve", str(eve),
+    )
+    validation = run(privileged_helper_cmd("suricata-test", "--rules", str(rules)), check=False)
     (run_dir / "suricata_rule_test.log").write_text(validation.stdout, encoding="utf-8", errors="replace")
     if validation.returncode != 0:
         (run_dir / "suricata.status").write_text("suricata rule validation failed; see suricata_rule_test.log\n", encoding="utf-8")
@@ -780,6 +794,239 @@ def guest_mkdir(args: argparse.Namespace, path: str) -> None:
     run(["VBoxManage", "guestcontrol", args.vm, "mkdir", path, *guest_args(args), "--parents"], check=False)
 
 
+def analysis_vm_enabled(args: argparse.Namespace) -> bool:
+    return bool(str(getattr(args, "analysis_vm", "")).strip()) and not bool(getattr(args, "local_analysis_only", False))
+
+
+def analysis_vm_state(args: argparse.Namespace) -> str:
+    return vm_state(args.analysis_vm)
+
+
+def analysis_guest_args(args: argparse.Namespace) -> list[str]:
+    return ["--username", args.analysis_vm_user, "--password", args.analysis_vm_password]
+
+
+def analysis_guest_run(args: argparse.Namespace, exe: str, guest_argv: list[str], *, timeout: int = 120, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = [
+        "VBoxManage", "guestcontrol", args.analysis_vm, "run",
+        *analysis_guest_args(args),
+        "--exe", exe,
+        "--wait-stdout", "--wait-stderr",
+        "--timeout", str(timeout * 1000),
+        "--",
+        *guest_argv,
+    ]
+    return run(cmd, check=check)
+
+
+def analysis_guest_ready(args: argparse.Namespace) -> bool:
+    result = analysis_guest_run(
+        args,
+        "/bin/sh",
+        ["-lc", "whoami"],
+        timeout=20,
+        check=False,
+    )
+    return result.returncode == 0 and args.analysis_vm_user.lower() in result.stdout.lower()
+
+
+def wait_analysis_guest_ready(args: argparse.Namespace, timeout: int = 180) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if analysis_guest_ready(args):
+            return
+        time.sleep(5)
+    raise RuntimeError(f"Analysis VM '{args.analysis_vm}' Guest Control did not become ready")
+
+
+def ensure_analysis_vm_running(args: argparse.Namespace) -> bool:
+    was_running = analysis_vm_state(args) == "running"
+    if not was_running:
+        run(["VBoxManage", "startvm", args.analysis_vm, "--type", "headless"])
+    wait_analysis_guest_ready(args)
+    return was_running
+
+
+def stop_analysis_vm_if_started(args: argparse.Namespace, was_running: bool) -> None:
+    if was_running:
+        return
+    if analysis_vm_state(args) == "running":
+        run(["VBoxManage", "controlvm", args.analysis_vm, "acpipowerbutton"], check=False)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if analysis_vm_state(args) == "poweroff":
+                return
+            time.sleep(2)
+        run(["VBoxManage", "controlvm", args.analysis_vm, "poweroff"], check=False)
+
+
+def stage_analysis_run_dir(args: argparse.Namespace, run_dir: Path) -> tuple[Path, str]:
+    host_root = args.analysis_share_host.expanduser().resolve()
+    guest_root = args.analysis_share_guest.rstrip("/")
+    host_root.mkdir(parents=True, exist_ok=True)
+    stage_root = host_root / "analysis-runs"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    staged_run_dir = stage_root / run_dir.name
+    if staged_run_dir.exists():
+        shutil.rmtree(staged_run_dir)
+    shutil.copytree(run_dir, staged_run_dir)
+    guest_run_dir = f"{guest_root}/analysis-runs/{run_dir.name}"
+    return staged_run_dir, guest_run_dir
+
+
+def sync_analysis_outputs(staged_run_dir: Path, run_dir: Path) -> None:
+    shutil.copytree(staged_run_dir, run_dir, dirs_exist_ok=True)
+
+
+def shell_join(argv: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in argv)
+
+
+def prepare_analysis_stage(args: argparse.Namespace, run_dir: Path) -> tuple[Path, str]:
+    host_root = args.analysis_share_host.expanduser().resolve()
+    guest_root = args.analysis_share_guest.rstrip("/")
+    host_root.mkdir(parents=True, exist_ok=True)
+    stage_root = host_root / "analysis-runs"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    staged_run_dir = stage_root / run_dir.name
+    if staged_run_dir.exists():
+        shutil.rmtree(staged_run_dir)
+    shutil.copytree(run_dir, staged_run_dir)
+    guest_run_dir = f"{guest_root}/analysis-runs/{run_dir.name}"
+    return staged_run_dir, guest_run_dir
+
+
+def sync_host_run_to_stage(run_dir: Path, staged_run_dir: Path) -> None:
+    shutil.copytree(run_dir, staged_run_dir, dirs_exist_ok=True)
+
+
+def start_analysis_gateway(args: argparse.Namespace, run_dir: Path) -> dict[str, object]:
+    staged_run_dir, guest_run_dir = prepare_analysis_stage(args, run_dir)
+    guest_log_dir = f"{guest_run_dir}/inetsim-logs"
+    guest_report_dir = f"{guest_run_dir}/inetsim-report"
+    guest_pcap = f"{guest_run_dir}/capture.pcapng"
+    guest_tshark_log = f"{guest_run_dir}/tshark.log"
+    guest_tshark_pid = f"{guest_run_dir}/tshark.pid"
+    guest_inetsim_pid = f"{guest_run_dir}/inetsim.pid"
+    guest_inetsim_stdout = f"{guest_run_dir}/inetsim.stdout"
+    guest_dnsmasq_pid = f"{guest_run_dir}/dnsmasq.pid"
+    guest_dnsmasq_log = f"{guest_run_dir}/dnsmasq.log"
+    guest_dnsmasq_stdout = f"{guest_run_dir}/dnsmasq.stdout"
+    analysis_vm_was_running = ensure_analysis_vm_running(args)
+    bootstrap = "\n".join([
+        "set -euo pipefail",
+        f"mkdir -p {shlex.quote(guest_run_dir)} {shlex.quote(guest_log_dir)} {shlex.quote(guest_report_dir)}",
+        f"rm -f {shlex.quote(guest_pcap)} {shlex.quote(guest_tshark_log)} {shlex.quote(guest_tshark_pid)} {shlex.quote(guest_inetsim_pid)} {shlex.quote(guest_inetsim_stdout)} {shlex.quote(guest_dnsmasq_pid)} {shlex.quote(guest_dnsmasq_log)} {shlex.quote(guest_dnsmasq_stdout)}",
+        "sudo -n pkill -x inetsim_main >/dev/null 2>&1 || true",
+        "sudo -n pkill -f '^inetsim_' >/dev/null 2>&1 || true",
+        "sudo -n pkill -x tshark >/dev/null 2>&1 || true",
+        "sudo -n pkill dnsmasq >/dev/null 2>&1 || true",
+        (
+            f"sudo -n bash -lc {shlex.quote(f'nohup tshark -i {shlex.quote(args.analysis_interface)} -a duration:{args.duration + 120} -w {shlex.quote(guest_pcap)} > {shlex.quote(guest_tshark_log)} 2>&1 < /dev/null & echo $! > {shlex.quote(guest_tshark_pid)}')}"
+        ),
+        (
+            f"sudo -n bash -lc {shlex.quote(f'nohup dnsmasq --no-daemon --keep-in-foreground --no-resolv --log-queries --log-facility={shlex.quote(guest_dnsmasq_log)} --interface={shlex.quote(args.analysis_interface)} --listen-address={shlex.quote(args.analysis_service_ip)} --bind-interfaces --address=/#/{shlex.quote(args.analysis_service_ip)} > {shlex.quote(guest_dnsmasq_stdout)} 2>&1 < /dev/null & echo $! > {shlex.quote(guest_dnsmasq_pid)}')}"
+        ),
+        (
+            f"sudo -n bash -lc {shlex.quote(f'nohup inetsim --bind-address={args.analysis_service_ip} --user=root --log-dir={shlex.quote(guest_log_dir)} --report-dir={shlex.quote(guest_report_dir)} --session={shlex.quote(run_dir.name)} > {shlex.quote(guest_inetsim_stdout)} 2>&1 < /dev/null & echo $! > {shlex.quote(guest_inetsim_pid)}')}"
+        ),
+        "sleep 5",
+        f"test -f {shlex.quote(guest_inetsim_pid)}",
+        f"test -f {shlex.quote(guest_tshark_pid)}",
+        f"test -f {shlex.quote(guest_dnsmasq_pid)}",
+        f"cat {shlex.quote(guest_inetsim_pid)} {shlex.quote(guest_tshark_pid)} {shlex.quote(guest_dnsmasq_pid)}",
+        f"ss -ltnup | grep -E ':(53|80|443|8080)\\b' || true",
+    ])
+    result = analysis_guest_run(args, "/bin/bash", ["-lc", bootstrap], timeout=180, check=False)
+    (run_dir / "analysis_gateway_start.log").write_text(result.stdout, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        stop_analysis_vm_if_started(args, analysis_vm_was_running)
+        raise RuntimeError(f"Failed to start REMnux gateway services; see {run_dir / 'analysis_gateway_start.log'}")
+    gateway_state = {
+        "analysis_vm_was_running": analysis_vm_was_running,
+        "staged_run_dir": staged_run_dir,
+        "guest_run_dir": guest_run_dir,
+        "guest_inetsim_pid": guest_inetsim_pid,
+        "guest_tshark_pid": guest_tshark_pid,
+        "guest_dnsmasq_pid": guest_dnsmasq_pid,
+    }
+    (run_dir / "analysis_gateway_state.json").write_text(json.dumps({
+        "analysis_vm": args.analysis_vm,
+        "analysis_service_ip": args.analysis_service_ip,
+        "analysis_interface": args.analysis_interface,
+        "guest_run_dir": guest_run_dir,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    return gateway_state
+
+
+def stop_analysis_gateway(args: argparse.Namespace, run_dir: Path, gateway_state: dict[str, object]) -> None:
+    staged_run_dir = Path(str(gateway_state["staged_run_dir"]))
+    guest_run_dir = str(gateway_state["guest_run_dir"])
+    guest_inetsim_pid = str(gateway_state["guest_inetsim_pid"])
+    guest_tshark_pid = str(gateway_state["guest_tshark_pid"])
+    guest_dnsmasq_pid = str(gateway_state["guest_dnsmasq_pid"])
+    shutdown = "\n".join([
+        "set -euo pipefail",
+        f"sudo -n pkill -F {shlex.quote(guest_inetsim_pid)} >/dev/null 2>&1 || true",
+        f"sudo -n pkill -F {shlex.quote(guest_tshark_pid)} >/dev/null 2>&1 || true",
+        f"sudo -n pkill -F {shlex.quote(guest_dnsmasq_pid)} >/dev/null 2>&1 || true",
+        "sleep 2",
+        f"ls -la {shlex.quote(guest_run_dir)} || true",
+    ])
+    result = analysis_guest_run(args, "/bin/bash", ["-lc", shutdown], timeout=120, check=False)
+    (run_dir / "analysis_gateway_stop.log").write_text(result.stdout, encoding="utf-8", errors="replace")
+    sync_analysis_outputs(staged_run_dir, run_dir)
+    stop_analysis_vm_if_started(args, bool(gateway_state.get("analysis_vm_was_running", False)))
+
+
+def run_analysis_in_analysis_vm(args: argparse.Namespace, run_dir: Path) -> Path:
+    staged_run_dir, guest_run_dir = stage_analysis_run_dir(args, run_dir)
+    guest_script = f"{args.analysis_share_guest.rstrip('/')}/local_vbox_detonate.py"
+    run_dir_hint = staged_run_dir / "analysis_vm_stage.json"
+    run_dir_hint.write_text(json.dumps({
+        "analysis_vm": args.analysis_vm,
+        "guest_run_dir": guest_run_dir,
+        "guest_script": guest_script,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    shutil.copy2(Path(__file__), args.analysis_share_host / "local_vbox_detonate.py")
+    analysis_vm_was_running = ensure_analysis_vm_running(args)
+    try:
+        result = analysis_guest_run(
+            args,
+            "/bin/sh",
+            [
+                "-lc",
+                " ".join([
+                    "python3",
+                    guest_script,
+                    "--parse-only",
+                    "--retriage",
+                    "--run-dir",
+                    shlex.quote(guest_run_dir),
+                    "--vm",
+                    shlex.quote(args.vm),
+                    "--snapshot",
+                    shlex.quote(args.snapshot),
+                    "--interface",
+                    shlex.quote(args.interface),
+                    "--host-ip",
+                    shlex.quote(args.host_ip),
+                    "--guest-ip",
+                    shlex.quote(args.guest_ip),
+                ]),
+            ],
+            timeout=max(300, args.duration + 180),
+            check=False,
+        )
+        (run_dir / "analysis_vm.log").write_text(result.stdout, encoding="utf-8", errors="replace")
+        if result.returncode != 0:
+            raise RuntimeError(f"Analysis VM parse run failed; see {run_dir / 'analysis_vm.log'}")
+    finally:
+        stop_analysis_vm_if_started(args, analysis_vm_was_running)
+    sync_analysis_outputs(staged_run_dir, run_dir)
+    return run_dir / "analysis.md"
+
+
 def launch_with_guestcontrol(args: argparse.Namespace, sample: Path, run_dir: Path) -> bool:
     if not args.guestcontrol:
         return False
@@ -798,6 +1045,10 @@ def launch_with_guestcontrol(args: argparse.Namespace, sample: Path, run_dir: Pa
         "\n".join([
             "$ErrorActionPreference = 'Continue'",
             "Set-Content -Path 'C:\\Analysis\\runner.txt' -Value ('started ' + (Get-Date -Format o))",
+            *([
+                "$LabIf = Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -and $_.InterfaceAlias -ne 'Loopback Pseudo-Interface 1' } | Select-Object -First 1",
+                f"if ($LabIf) {{ Set-DnsClientServerAddress -InterfaceAlias $LabIf.InterfaceAlias -ServerAddresses @('{args.analysis_service_ip}') -ErrorAction SilentlyContinue; ipconfig /flushdns | Out-Null; Add-Content -Path 'C:\\Analysis\\runner.txt' -Value ('dns ' + $LabIf.InterfaceAlias + ' -> {args.analysis_service_ip}') }}",
+            ] if analysis_vm_enabled(args) else []),
             "$p = Start-Process -FilePath 'C:\\Analysis\\Sample\\sample.exe' -PassThru",
             f"Wait-Process -Id $p.Id -Timeout {max(5, args.duration)} -ErrorAction SilentlyContinue",
             "Add-Content -Path 'C:\\Analysis\\runner.txt' -Value ('finished ' + (Get-Date -Format o))",
@@ -1118,13 +1369,48 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
         generated.append("sigma_dns.yml")
     if (run_dir / "sigma_behavior.yml").exists():
         generated.append("sigma_behavior.yml")
+    suspicious_domains_text = chr(10).join(f'- `{d}`' for d in suspicious_domains) if suspicious_domains else '- None observed'
+    dns_queries_text = chr(10).join(f'- `{d}`' for d in dns_queries) if dns_queries else '- None observed'
+    tls_sni_text = chr(10).join(f'- `{d}`' for d in tls_sni) if tls_sni else '- None observed'
+    suspicious_http_requests_text = (
+        chr(10).join(f"- `{r.get('method')} {r.get('host')}{r.get('uri')}`" for r in suspicious_http_requests)
+        if suspicious_http_requests else '- None observed'
+    )
+    suspicious_http_events_text = (
+        chr(10).join(f"- `{e.get('method')} {e.get('host')}{e.get('path')}` from `{e.get('client')}` UA `{e.get('user_agent')}`" for e in suspicious_http_events)
+        if suspicious_http_events else '- None observed'
+    )
+    suricata_alerts_text = (
+        chr(10).join(f"- `{a.get('alert', {}).get('signature')}` severity `{a.get('alert', {}).get('severity')}`" for a in suricata_alerts)
+        if suricata_alerts else '- None observed'
+    )
+    behaviors_text = (
+        chr(10).join(f"- `{b.get('type')}` {b.get('description')} severity `{b.get('severity')}`" for b in behaviors)
+        if isinstance(behaviors, list) and behaviors else '- None observed'
+    )
+    autoruns_text = (
+        chr(10).join(f"- `{a.get('key')}\\{a.get('name')}` -> `{a.get('data')}`" for a in autoruns[:50])
+        if isinstance(autoruns, list) and autoruns else '- None observed'
+    )
+    dropped_files_text = (
+        chr(10).join(f"- `{d.get('Path')}` sha256 `{d.get('SHA256', 'n/a')}`" for d in dropped_files[:50] if isinstance(d, dict))
+        if isinstance(dropped_files, list) and dropped_files else '- None observed'
+    )
+    static_iocs_text = json.dumps(static_iocs, indent=2) if static_iocs else '{}'
+    generated_text = chr(10).join(f'- `{name}`' for name in generated)
+    artifact_files_text = (
+        chr(10).join(f'- `{name}`' for name in artifact_files[:100])
+        if isinstance(artifact_files, list) and artifact_files else '- No guest artifact archive was parsed'
+    )
     body = f"""# Local Sandbox Run - {sample_sha256[:12]}
 
 - Timestamp: {dt.datetime.now(dt.UTC).isoformat()}
 - VM: `{args.vm}`
 - Snapshot restored after run: `{args.snapshot}`
 - Interface: `{args.interface}`
-- Host-only gateway/DNS: `{args.host_ip}`
+- Host-only gateway/DNS: `{args.analysis_service_ip if analysis_vm_enabled(args) else args.host_ip}`
+- Analysis VM: `{args.analysis_vm if analysis_vm_enabled(args) else 'local-host'}`
+- Analysis interface: `{args.analysis_interface if analysis_vm_enabled(args) else args.interface}`
 - Guest IP: `{args.guest_ip}`
 - Sample SHA256: `{sample_sha256}`
 - Sample file: `{sample.name}`
@@ -1132,55 +1418,55 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
 
 ## Suspicious Domains
 
-{chr(10).join(f'- `{d}`' for d in suspicious_domains) if suspicious_domains else '- None observed'}
+{suspicious_domains_text}
 
 ## DNS Queries
 
-{chr(10).join(f'- `{d}`' for d in dns_queries) if dns_queries else '- None observed'}
+{dns_queries_text}
 
 ## TLS SNI
 
-{chr(10).join(f'- `{d}`' for d in tls_sni) if tls_sni else '- None observed'}
+{tls_sni_text}
 
 ## HTTP Requests
 
-{chr(10).join(f"- `{r.get('method')} {r.get('host')}{r.get('uri')}`" for r in suspicious_http_requests) if suspicious_http_requests else '- None observed'}
+{suspicious_http_requests_text}
 
 Full HTTP request count: `{len(http_requests)}`
 
 ## Fake HTTP/HTTPS Hits
 
-{chr(10).join(f"- `{e.get('method')} {e.get('host')}{e.get('path')}` from `{e.get('client')}` UA `{e.get('user_agent')}`" for e in suspicious_http_events) if suspicious_http_events else '- None observed'}
+{suspicious_http_events_text}
 
 Full fake-service hit count: `{len(http_events)}`
 
 ## Suricata Alerts
 
-{chr(10).join(f"- `{a.get('alert', {}).get('signature')}` severity `{a.get('alert', {}).get('severity')}`" for a in suricata_alerts) if suricata_alerts else '- None observed'}
+{suricata_alerts_text}
 
 ## Behavioral Findings
 
-{chr(10).join(f"- `{b.get('type')}` {b.get('description')} severity `{b.get('severity')}`" for b in behaviors) if isinstance(behaviors, list) and behaviors else '- None observed'}
+{behaviors_text}
 
 ## Autoruns
 
-{chr(10).join(f"- `{a.get('key')}\\{a.get('name')}` -> `{a.get('data')}`" for a in autoruns[:50]) if isinstance(autoruns, list) and autoruns else '- None observed'}
+{autoruns_text}
 
 ## Dropped / Recently Modified Files
 
-{chr(10).join(f"- `{d.get('Path')}` sha256 `{d.get('SHA256', 'n/a')}`" for d in dropped_files[:50] if isinstance(d, dict)) if isinstance(dropped_files, list) and dropped_files else '- None observed'}
+{dropped_files_text}
 
 ## Static IOC Summary
 
-{json.dumps(static_iocs, indent=2) if static_iocs else '{}'}
+{static_iocs_text}
 
 ## Generated Detections
 
-{chr(10).join(f'- `{name}`' for name in generated)}
+{generated_text}
 
 ## Guest Artifact Inventory
 
-{chr(10).join(f'- `{name}`' for name in artifact_files[:100]) if isinstance(artifact_files, list) and artifact_files else '- No guest artifact archive was parsed'}
+{artifact_files_text}
 
 ## Guest Telemetry Setup
 
@@ -1210,17 +1496,20 @@ def parse_existing_run(args: argparse.Namespace) -> int:
     if not run_dir.exists():
         raise RuntimeError(f"Run directory not found: {run_dir}")
     sample_sha256 = derive_sample_sha_from_run_dir(run_dir)
+    sample = next(run_dir.glob("*.sample"), run_dir / "sample.unknown")
+    triage: dict[str, object] = {}
+    if args.retriage and sample.exists():
+        triage = static_triage(sample, run_dir)
     pcap = run_dir / "capture.pcapng"
     summary = parse_artifacts(run_dir, pcap)
     static_path = run_dir / "static_triage.json"
     if static_path.exists():
         triage = json.loads(static_path.read_text(encoding="utf-8", errors="replace"))
         summary["static_iocs"] = triage.get("static_iocs", {})
-    else:
-        triage = {}
+    elif triage:
+        summary["static_iocs"] = triage.get("static_iocs", {})
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     make_rules(run_dir, sample_sha256, summary, triage)
-    sample = next(run_dir.glob("*.sample"), run_dir / "sample.unknown")
     report = write_report(args, run_dir, sample, sample_sha256, summary)
     print(report)
     return 0
@@ -1254,8 +1543,17 @@ def main() -> int:
     parser.add_argument("--kill-stale-capture", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-stale-capture", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--memory-dump", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--analysis-vm", default=DEFAULT_ANALYSIS_VM)
+    parser.add_argument("--analysis-vm-user", default=DEFAULT_ANALYSIS_VM_USER)
+    parser.add_argument("--analysis-vm-password", default=DEFAULT_ANALYSIS_VM_PASSWORD)
+    parser.add_argument("--analysis-share-host", type=Path, default=DEFAULT_ANALYSIS_SHARE_HOST)
+    parser.add_argument("--analysis-share-guest", default=DEFAULT_ANALYSIS_SHARE_GUEST)
+    parser.add_argument("--analysis-service-ip", default=DEFAULT_ANALYSIS_SERVICE_IP)
+    parser.add_argument("--analysis-interface", default=DEFAULT_ANALYSIS_INTERFACE)
+    parser.add_argument("--local-analysis-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--parse-only", action="store_true", help="Re-parse an existing run directory and regenerate detections/report")
     parser.add_argument("--report-only", action="store_true", help="Alias for --parse-only")
+    parser.add_argument("--retriage", action="store_true", help="Re-run static triage before parsing/report generation")
     parser.add_argument("--run-dir", type=Path, help="Existing run directory for --parse-only/--report-only")
     args = parser.parse_args()
 
@@ -1273,57 +1571,88 @@ def main() -> int:
     host_service_state: dict[str, bool] = {}
     suricata: subprocess.Popen | None = None
     tshark: subprocess.Popen | None = None
+    gateway_state: dict[str, object] | None = None
     run_dir: Path | None = None
     try:
         sample = extract_sample(args.sample, work_dir, args.password)
         sample_sha256 = sha256_file(sample)
         run_dir = args.run_root / f"{dt.datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{sample_sha256[:12]}"
         run_dir.mkdir(parents=True)
+        assert run_dir is not None
+        current_run_dir: Path = run_dir
         shutil.copy2(sample, run_dir / f"{sample_sha256}.sample")
-        preflight(args, run_dir)
-        host_service_state = stop_host_conflicts(run_dir, args.stop_apache)
-        triage = static_triage(sample, run_dir)
-        write_guest_scripts(run_dir)
-        iso_path = make_runner_iso(sample, run_dir)
+        preflight(args, current_run_dir)
+        if not analysis_vm_enabled(args):
+            host_service_state = stop_host_conflicts(current_run_dir, args.stop_apache)
+        triage: dict[str, object] = {}
+        if not analysis_vm_enabled(args):
+            triage = static_triage(sample, current_run_dir)
+        write_guest_scripts(current_run_dir)
+        iso_path = make_runner_iso(sample, current_run_dir)
 
-        service_procs = start_fake_services(args, run_dir)
-        suricata = start_suricata(args, run_dir)
+        if analysis_vm_enabled(args):
+            gateway_state = start_analysis_gateway(args, current_run_dir)
+        else:
+            service_procs = start_fake_services(args, current_run_dir)
+            suricata = start_suricata(args, current_run_dir)
         restore_and_start_vm(args)
 
-        pcap = run_dir / "capture.pcapng"
-        capture_duration = str(args.duration + 120)
-        tshark = start(
-            ["tshark", "-i", args.interface, "-a", f"duration:{capture_duration}", "-w", str(pcap)],
-            run_dir / "tshark.log",
-        )
-        time.sleep(2)
-        if tshark.poll() is not None:
-            raise RuntimeError(f"tshark failed to start; see {run_dir / 'tshark.log'}")
+        pcap = current_run_dir / "capture.pcapng"
+        if not analysis_vm_enabled(args):
+            capture_duration = str(args.duration + 120)
+            tshark = start(
+                privileged_helper_cmd(
+                    "capture",
+                    "--interface", args.interface,
+                    "--duration", capture_duration,
+                    "--output", str(pcap),
+                ),
+                current_run_dir / "tshark.log",
+            )
+            time.sleep(2)
+            if tshark.poll() is not None:
+                raise RuntimeError(f"tshark failed to start; see {current_run_dir / 'tshark.log'}")
 
         launched_with_guestcontrol = False
         if args.guestcontrol:
             wait_guest_ready(args)
-            launched_with_guestcontrol = launch_with_guestcontrol(args, sample, run_dir)
+            launched_with_guestcontrol = launch_with_guestcontrol(args, sample, current_run_dir)
         if not launched_with_guestcontrol:
-            mount_and_launch(args, iso_path, run_dir)
+            mount_and_launch(args, iso_path, current_run_dir)
             for second in range(0, args.duration, 30):
                 time.sleep(min(30, args.duration - second))
-                run(["VBoxManage", "controlvm", args.vm, "screenshotpng", str(run_dir / f"screenshot_{second + 30:03d}s.png")], check=False)
+                run(["VBoxManage", "controlvm", args.vm, "screenshotpng", str(current_run_dir / f"screenshot_{second + 30:03d}s.png")], check=False)
         else:
-            run(["VBoxManage", "controlvm", args.vm, "screenshotpng", str(run_dir / "after_guestcontrol_launch.png")], check=False)
+            run(["VBoxManage", "controlvm", args.vm, "screenshotpng", str(current_run_dir / "after_guestcontrol_launch.png")], check=False)
 
-        try:
-            tshark.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            stop_process(tshark)
-        tshark = None
-        pcap.chmod(0o644)
-        summary = parse_artifacts(run_dir, pcap)
-        summary["static_iocs"] = triage.get("static_iocs", {})
-        summary_path = run_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-        make_rules(run_dir, sample_sha256, summary, triage)
-        report = write_report(args, run_dir, sample, sample_sha256, summary)
+        if tshark:
+            try:
+                tshark.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                stop_process(tshark)
+            tshark = None
+        if suricata:
+            stop_process(suricata)
+            suricata = None
+        for proc in reversed(service_procs):
+            stop_process(proc)
+        service_procs = []
+        if gateway_state is not None:
+            sync_host_run_to_stage(current_run_dir, Path(str(gateway_state["staged_run_dir"])))
+            stop_analysis_gateway(args, current_run_dir, gateway_state)
+            gateway_state = None
+        run(privileged_helper_cmd("fix-run-dir", "--run-dir", str(current_run_dir)), check=False)
+        if pcap.exists():
+            pcap.chmod(0o644)
+        if analysis_vm_enabled(args):
+            report = run_analysis_in_analysis_vm(args, current_run_dir)
+        else:
+            summary = parse_artifacts(current_run_dir, pcap)
+            summary["static_iocs"] = triage.get("static_iocs", {})
+            summary_path = current_run_dir / "summary.json"
+            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+            make_rules(current_run_dir, sample_sha256, summary, triage)
+            report = write_report(args, current_run_dir, sample, sample_sha256, summary)
         print(report)
         return 0
     finally:
@@ -1333,6 +1662,12 @@ def main() -> int:
             stop_process(suricata)
         for proc in reversed(service_procs):
             stop_process(proc)
+        if gateway_state is not None and run_dir is not None:
+            try:
+                sync_host_run_to_stage(run_dir, Path(str(gateway_state["staged_run_dir"])))
+                stop_analysis_gateway(args, run_dir, gateway_state)
+            except Exception:
+                pass
         cleanup_vm(args)
         restore_host_conflicts(host_service_state, run_dir)
         shutil.rmtree(work_dir, ignore_errors=True)

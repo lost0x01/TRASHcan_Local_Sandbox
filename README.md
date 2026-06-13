@@ -1,6 +1,6 @@
 # RAIccoon Malware Sandbox
 
-RAIccoon Malware Sandbox is a local-first VirtualBox detonation lab for controlled Windows malware triage. It restores a clean Windows snapshot, starts host-only DNS/HTTP/HTTPS simulation, captures traffic, runs a sample through VirtualBox Guest Control, collects Windows artifacts, parses behavior, and generates triage detections.
+RAIccoon Malware Sandbox is a local-first VirtualBox detonation lab for controlled Windows malware triage. It restores a clean Windows snapshot, starts host-only DNS/HTTP/HTTPS simulation, captures traffic, runs a sample through the Windows guest, stages run artifacts into REMnux for static and network analysis, collects Windows artifacts, parses behavior, and generates triage detections.
 
 This repository is designed for defenders and researchers who want a reproducible sandbox without sending samples to public services.
 
@@ -13,6 +13,7 @@ This repository is designed for defenders and researchers who want a reproducibl
 - Per-run Suricata validation and capture
 - Windows guest collection for processes, services, tasks, WMI, autoruns, recent files, EVTX logs, and optional memory dumps
 - Sysmon-oriented behavior parsing
+- REMnux-offloaded static triage, PCAP parsing, and report regeneration via VirtualBox Guest Control
 - Auto-generated `summary.json`, `behavior_summary.json`, `analysis.md`, YARA, and Sigma detections
 - `--parse-only` / `--report-only` mode for reprocessing completed runs
 
@@ -25,7 +26,8 @@ Recommended defaults:
 - VM name: `win-malware-lab`
 - Snapshot: `clean-guestadditions-sysmon`
 - Host-only interface: `vboxnet0`
-- Host-only gateway: `192.168.56.1`
+- Host bridge IP (host-only adapter): `192.168.56.254`
+- REMnux analysis gateway / Windows default gateway + DNS: `192.168.56.1`
 - Guest IP: `192.168.56.20`
 - Sample archive password: `infected`
 
@@ -57,6 +59,15 @@ PYTHONPATH=src python3 -m raiccoon_sandbox.local_vbox_detonate \
   --run-dir /path/to/runs/2026-06-02_110358_deadbeefcafe
 ```
 
+Re-parse a completed run and force fresh static triage on the analysis side:
+
+```bash
+PYTHONPATH=src python3 -m raiccoon_sandbox.local_vbox_detonate \
+  --parse-only \
+  --retriage \
+  --run-dir /path/to/runs/2026-06-02_110358_deadbeefcafe
+```
+
 ## Repository Layout
 
 ```text
@@ -76,6 +87,7 @@ examples/                   Non-malicious example outputs/templates
 - `xorriso`
 - `7z`
 - `openssl`
+- REMnux VM with Guest Additions / Guest Control support recommended as the analysis VM
 - `suricata` recommended
 - `python-evtx` optional for Sysmon EVTX parsing
 - `zeek` optional for future protocol enrichment

@@ -1,3 +1,4 @@
+import argparse
 import json
 import tempfile
 import unittest
@@ -46,6 +47,27 @@ class LocalVBoxDetonateTests(unittest.TestCase):
             parsed = runner.parse_guest_artifacts(tmp_path)
             self.assertTrue(parsed["guest_artifacts_present"])
             self.assertTrue(parsed["behaviors"])
+
+    def test_parse_existing_run_retriage_generates_static_triage(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "2026-06-13_abcdefabcdef"
+            run_dir.mkdir()
+            (run_dir / ("a" * 64 + ".sample")).write_bytes(b"MZ" + b"\x00" * 64)
+            args = argparse.Namespace(
+                run_dir=run_dir,
+                retriage=True,
+                vm="win-malware-lab",
+                snapshot="clean-guestadditions-sysmon",
+                interface="vboxnet0",
+                host_ip="192.168.56.1",
+                guest_ip="192.168.56.20",
+            )
+
+            rc = runner.parse_existing_run(args)
+            self.assertEqual(rc, 0)
+            self.assertTrue((run_dir / "static_triage.json").exists())
+            self.assertTrue((run_dir / "summary.json").exists())
+            self.assertTrue((run_dir / "analysis.md").exists())
 
 
 if __name__ == "__main__":

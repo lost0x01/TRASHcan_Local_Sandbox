@@ -6,7 +6,7 @@ vm:
 
 network:
   interface: vboxnet0
-  host_ip: 192.168.56.1
+  host_ip: 192.168.56.254
   guest_ip: 192.168.56.20
 
 run:
@@ -15,4 +15,14 @@ run:
   stop_apache: true
   suricata: true
   memory_dump: false
+
+analysis:
+  vm: remnux
+  vm_user: remnux
+  vm_password: malware
+  share_host: /home/lost0x01/vm-shares/remnux-transfer
+  share_guest: /media/sf_remnux_transfer
+  service_ip: 192.168.56.1
+  interface: enp0s3
+  local_analysis_only: false
 
