@@ -17,6 +17,11 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CUSTOM_SURICATA_RULES_SRC="${SCRIPT_DIR}/../rules/suricata/trashcan-local.rules"
+CUSTOM_YARA_RULES_SRC="${SCRIPT_DIR}/../rules/yara/trashcan_static_triage.yar"
+YARA_TRIAGE_HELPER_SRC="${SCRIPT_DIR}/run_yara_triage.sh"
+
 ANALYSIS_IP="10.10.1.10"
 ANALYSIS_IFACE="eth1"    # Interface facing FlareVM
 MGMT_IFACE="eth0"        # Interface facing management subnet
@@ -38,7 +43,8 @@ apt-get install -y --no-install-recommends \
   jq \
   awscli \
   curl \
-  net-tools
+  net-tools \
+  yara
 
 # ── IP forwarding ──────────────────────────────────────────────────────────
 log "Enabling IP forwarding …"
@@ -126,6 +132,7 @@ default-log-dir: /var/log/suricata/
 # Rule sets
 rule-files:
   - suricata.rules
+  - /etc/suricata/rules/trashcan-local.rules
   - /etc/suricata/rules/emerging-malware.rules
   - /etc/suricata/rules/emerging-trojan.rules
   - /etc/suricata/rules/emerging-exploit.rules
@@ -137,6 +144,27 @@ mkdir -p /etc/suricata/rules
 curl -sL "https://rules.emergingthreats.net/open/suricata-5.0/emerging.rules.tar.gz" \
   | tar xz -C /etc/suricata/rules/ --strip-components=1 2>/dev/null || \
   warn "ET rules download failed — using default rules only"
+
+if [[ -f "${CUSTOM_SURICATA_RULES_SRC}" ]]; then
+  install -m 0644 "${CUSTOM_SURICATA_RULES_SRC}" /etc/suricata/rules/trashcan-local.rules
+  log "Installed custom TRASHcan Suricata ruleset"
+else
+  warn "Custom TRASHcan Suricata ruleset not found at ${CUSTOM_SURICATA_RULES_SRC}"
+fi
+
+install -d -m 0755 /opt/trashcan/rules/yara /opt/trashcan/scripts
+if [[ -f "${CUSTOM_YARA_RULES_SRC}" ]]; then
+  install -m 0644 "${CUSTOM_YARA_RULES_SRC}" /opt/trashcan/rules/yara/trashcan_static_triage.yar
+  log "Installed bundled TRASHcan YARA triage ruleset"
+else
+  warn "Bundled TRASHcan YARA ruleset not found at ${CUSTOM_YARA_RULES_SRC}"
+fi
+if [[ -f "${YARA_TRIAGE_HELPER_SRC}" ]]; then
+  install -m 0755 "${YARA_TRIAGE_HELPER_SRC}" /opt/trashcan/scripts/run_yara_triage.sh
+  log "Installed TRASHcan YARA triage helper"
+else
+  warn "TRASHcan YARA triage helper not found at ${YARA_TRIAGE_HELPER_SRC}"
+fi
 
 # ── PCAP directory ─────────────────────────────────────────────────────────
 log "Setting up PCAP capture directory …"

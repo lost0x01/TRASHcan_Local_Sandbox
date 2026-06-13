@@ -57,6 +57,38 @@ DEFAULT_ANALYSIS_SERVICE_IP = "192.168.56.1"
 DEFAULT_ANALYSIS_INTERFACE = "enp0s3"
 DEFAULT_HTTP_BODY_LIMIT = 1024 * 1024
 PRIVILEGED_HELPER_PATH = Path(os.getenv("TRASHCAN_PRIV_HELPER", "/usr/local/libexec/trashcan/trashcan-net-helper.py"))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUNDLED_SURICATA_RULESET = REPO_ROOT / "rules" / "suricata" / "trashcan-local.rules"
+BUNDLED_YARA_RULESET = REPO_ROOT / "rules" / "yara" / "trashcan_static_triage.yar"
+YARA_TRIAGE_HELPER = REPO_ROOT / "scripts" / "run_yara_triage.sh"
+
+YARA_TRIAGE_KQL_SNIPPETS = {
+    "TRASHcan_PowerShell_EncodedCommand_Artifacts": [
+        "DeviceProcessEvents",
+        "| where FileName in~ ('powershell.exe', 'pwsh.exe')",
+        "| where ProcessCommandLine has_any (' -enc', 'EncodedCommand', 'FromBase64String', 'DownloadString', 'IEX(')",
+    ],
+    "TRASHcan_Remote_Access_Tool_Artifacts": [
+        "DeviceProcessEvents",
+        "| where ProcessCommandLine has_any ('AnyDesk', 'RustDesk', 'ScreenConnect', 'NetSupport')",
+    ],
+    "TRASHcan_Credential_Access_Artifacts": [
+        "DeviceProcessEvents",
+        "| where ProcessCommandLine has_any ('sekurlsa', 'lsassy', 'procdump', 'MiniDumpWriteDump')",
+    ],
+    "TRASHcan_Stealer_Exfil_Artifacts": [
+        "DeviceNetworkEvents",
+        "| where RemoteUrl has_any ('api.telegram.org', 'pastebin.com', 'anonfiles', 'temp.sh') or RemoteUrl contains 'gate.php'",
+    ],
+    "TRASHcan_Loader_Stager_Artifacts": [
+        "DeviceProcessEvents",
+        "| where ProcessCommandLine has_any ('bitsadmin', 'certutil', 'mshta', 'rundll32', 'regsvr32', 'url.dll')",
+    ],
+    "TRASHcan_Ransomware_Note_Artifacts": [
+        "DeviceFileEvents",
+        "| where FolderPath has_any ('Desktop', 'Documents') and FileName has_any ('README', 'RECOVER', 'DECRYPT')",
+    ],
+}
 
 
 IOC_PATTERNS = {
@@ -77,6 +109,18 @@ BENIGN_EXACT_DOMAINS = {
     "ctldl.windowsupdate.com",
     "www.msftconnecttest.com",
 }
+
+
+def bundled_suricata_ruleset_path() -> Path:
+    return Path(os.getenv("TRASHCAN_BUNDLED_SURICATA_RULESET", str(BUNDLED_SURICATA_RULESET)))
+
+
+def bundled_yara_ruleset_path() -> Path:
+    return Path(os.getenv("TRASHCAN_BUNDLED_YARA_RULESET", str(BUNDLED_YARA_RULESET)))
+
+
+def yara_triage_helper_path() -> Path:
+    return Path(os.getenv("TRASHCAN_YARA_TRIAGE_HELPER", str(YARA_TRIAGE_HELPER)))
 
 
 def normalize_domain(value: object) -> str:
@@ -451,6 +495,84 @@ level: high
 """
         (run_dir / "sigma_behavior.yml").write_text(behavior_rule, encoding="utf-8")
 
+    yara_triage = summary.get("yara_triage", {})
+    matched_rules = yara_triage.get("matched_rules", []) if isinstance(yara_triage, dict) else []
+    if isinstance(matched_rules, list) and matched_rules:
+        sigma_rule_lines = "\n".join(f"      - '{name}'" for name in matched_rules)
+        sigma_family_rule = f"""title: Sandbox Bundled YARA Family Triage Hits {sample_sha256[:12]}
+id: {uuid.uuid5(uuid.NAMESPACE_DNS, sample_sha256 + '-yara-family-triage')}
+status: experimental
+description: Correlates sandbox triage hits with Windows process or script telemetry for malware-family-style artifacts.
+references:
+  - local-sandbox-run:{sample_sha256}
+author: RAIccoon local sandbox
+date: {dt.date.today().isoformat()}
+tags:
+  - attack.execution
+  - attack.command-and-control
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    SandboxYaraRule:
+{sigma_rule_lines}
+  condition: selection
+falsepositives:
+  - Lab validation or controlled malware research runs
+level: high
+"""
+        (run_dir / "sigma_yara_family.yml").write_text(sigma_family_rule, encoding="utf-8")
+
+        kql_sections = [
+            "// Microsoft Defender XDR / Advanced Hunting queries generated from TRASHcan bundled YARA triage",
+            f"// sample_sha256: {sample_sha256}",
+            "",
+        ]
+        for rule_name in matched_rules:
+            snippet = YARA_TRIAGE_KQL_SNIPPETS.get(str(rule_name))
+            if not snippet:
+                continue
+            kql_sections.append(f"// {rule_name}")
+            kql_sections.extend(snippet)
+            kql_sections.append("| project Timestamp, DeviceName, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, FolderPath")
+            kql_sections.append("| limit 50")
+            kql_sections.append("")
+        if sigma_domains:
+            domain_filters = ", ".join(f"'{d}'" for d in sigma_domains)
+            kql_sections.extend([
+                "// Suspicious DNS domains observed in the sandbox run",
+                "DeviceNetworkEvents",
+                f"| where RemoteUrl has_any ({domain_filters}) or RemoteDnsDomain has_any ({domain_filters})",
+                "| project Timestamp, DeviceName, InitiatingProcessFileName, InitiatingProcessCommandLine, RemoteUrl, RemoteDnsDomain",
+                "| limit 50",
+                "",
+            ])
+        (run_dir / "kql_triage_hunts.kql").write_text("\n".join(kql_sections).rstrip() + "\n", encoding="utf-8")
+
+
+def stage_analysis_support_files(staged_run_dir: Path) -> dict[str, Path]:
+    support_root = staged_run_dir / "bundled_support"
+    scripts_dir = support_root / "scripts"
+    suricata_dir = support_root / "rules" / "suricata"
+    yara_dir = support_root / "rules" / "yara"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    suricata_dir.mkdir(parents=True, exist_ok=True)
+    yara_dir.mkdir(parents=True, exist_ok=True)
+    helper_dst = scripts_dir / YARA_TRIAGE_HELPER.name
+    suricata_dst = suricata_dir / BUNDLED_SURICATA_RULESET.name
+    yara_dst = yara_dir / BUNDLED_YARA_RULESET.name
+    shutil.copy2(YARA_TRIAGE_HELPER, helper_dst)
+    shutil.copy2(BUNDLED_SURICATA_RULESET, suricata_dst)
+    shutil.copy2(BUNDLED_YARA_RULESET, yara_dst)
+    helper_dst.chmod(0o755)
+    return {
+        "support_root": support_root,
+        "helper": helper_dst,
+        "suricata_ruleset": suricata_dst,
+        "yara_ruleset": yara_dst,
+    }
+
 
 def extract_sample(input_path: Path, work_dir: Path, password: str) -> Path:
     if input_path.suffix.lower() == ".7z":
@@ -567,6 +689,81 @@ def start_fake_services(args: argparse.Namespace, run_dir: Path) -> list[subproc
     return procs
 
 
+def build_host_suricata_rules(run_dir: Path) -> Path:
+    rules = run_dir / "suricata_local.rules"
+    bundled_path = bundled_suricata_ruleset_path()
+    bundled = ""
+    if bundled_path.exists():
+        bundled = bundled_path.read_text(encoding="utf-8", errors="replace").rstrip()
+    local_rules = "\n".join([
+        'alert dns any any -> any any (msg:"RAIccoon suspicious .pw DNS query"; dns.query; content:".pw"; nocase; endswith; sid:9000001; rev:1;)',
+        'alert tls any any -> any any (msg:"RAIccoon suspicious .pw TLS SNI"; tls.sni; content:".pw"; nocase; endswith; sid:9000002; rev:1;)',
+    ])
+    rules.write_text("\n\n".join(part for part in (bundled, local_rules) if part) + "\n", encoding="utf-8")
+    return rules
+
+
+def parse_yara_output(output: str) -> list[dict[str, str]]:
+    matches: list[dict[str, str]] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        matches.append({
+            "rule": parts[0],
+            "target": parts[1] if len(parts) > 1 else "",
+        })
+    return matches
+
+
+def run_bundled_yara_triage(run_dir: Path, sample: Path | None = None) -> dict[str, object]:
+    helper_path = yara_triage_helper_path()
+    ruleset_path = bundled_yara_ruleset_path()
+    summary: dict[str, object] = {
+        "helper": str(helper_path),
+        "ruleset": str(ruleset_path),
+        "targets_scanned": [],
+        "matches": [],
+        "matched_rules": [],
+        "match_count": 0,
+    }
+    if not helper_path.exists() or not ruleset_path.exists() or not shutil.which("yara"):
+        summary["status"] = "skipped"
+        summary["reason"] = "helper, bundled ruleset, or yara binary unavailable"
+        (run_dir / "yara_triage_hits.txt").write_text("", encoding="utf-8")
+        (run_dir / "yara_triage_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        return summary
+
+    targets: list[Path] = []
+    if sample and sample.exists():
+        targets.append(sample)
+    guest_artifacts = run_dir / "guest_artifacts"
+    if guest_artifacts.exists():
+        targets.append(guest_artifacts)
+
+    hit_lines: list[str] = []
+    matches: list[dict[str, str]] = []
+    for target in targets:
+        result = run([str(helper_path), str(target)], check=False)
+        output = result.stdout.strip()
+        if output:
+            hit_lines.extend(output.splitlines())
+            matches.extend(parse_yara_output(output))
+        summary["targets_scanned"].append(str(target))  # type: ignore[index]
+
+    matched_rules = sorted({m["rule"] for m in matches})
+    summary.update({
+        "status": "ok",
+        "matches": matches,
+        "matched_rules": matched_rules,
+        "match_count": len(matches),
+    })
+    (run_dir / "yara_triage_hits.txt").write_text("\n".join(hit_lines) + ("\n" if hit_lines else ""), encoding="utf-8")
+    (run_dir / "yara_triage_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    return summary
+
+
 def start_suricata(args: argparse.Namespace, run_dir: Path) -> subprocess.Popen | None:
     if not args.suricata or not shutil.which("suricata"):
         (run_dir / "suricata.status").write_text(
@@ -577,15 +774,7 @@ def start_suricata(args: argparse.Namespace, run_dir: Path) -> subprocess.Popen 
     eve = run_dir / "suricata_eve.json"
     log_dir = run_dir / "suricata"
     log_dir.mkdir(exist_ok=True)
-    rules = run_dir / "suricata_local.rules"
-    rules.write_text(
-        "\n".join([
-            'alert dns any any -> any any (msg:"RAIccoon suspicious .pw DNS query"; dns.query; content:".pw"; nocase; endswith; sid:9000001; rev:1;)',
-            'alert tls any any -> any any (msg:"RAIccoon suspicious .pw TLS SNI"; tls.sni; content:".pw"; nocase; endswith; sid:9000002; rev:1;)',
-            "",
-        ]),
-        encoding="ascii",
-    )
+    rules = build_host_suricata_rules(run_dir)
     cmd = privileged_helper_cmd(
         "suricata-run",
         "--interface", args.interface,
@@ -870,6 +1059,7 @@ def stage_analysis_run_dir(args: argparse.Namespace, run_dir: Path) -> tuple[Pat
     if staged_run_dir.exists():
         shutil.rmtree(staged_run_dir)
     shutil.copytree(run_dir, staged_run_dir)
+    stage_analysis_support_files(staged_run_dir)
     guest_run_dir = f"{guest_root}/analysis-runs/{run_dir.name}"
     return staged_run_dir, guest_run_dir
 
@@ -892,6 +1082,7 @@ def prepare_analysis_stage(args: argparse.Namespace, run_dir: Path) -> tuple[Pat
     if staged_run_dir.exists():
         shutil.rmtree(staged_run_dir)
     shutil.copytree(run_dir, staged_run_dir)
+    stage_analysis_support_files(staged_run_dir)
     guest_run_dir = f"{guest_root}/analysis-runs/{run_dir.name}"
     return staged_run_dir, guest_run_dir
 
@@ -982,6 +1173,8 @@ def stop_analysis_gateway(args: argparse.Namespace, run_dir: Path, gateway_state
 def run_analysis_in_analysis_vm(args: argparse.Namespace, run_dir: Path) -> Path:
     staged_run_dir, guest_run_dir = stage_analysis_run_dir(args, run_dir)
     guest_script = f"{args.analysis_share_guest.rstrip('/')}/local_vbox_detonate.py"
+    guest_helper = f"{guest_run_dir}/bundled_support/scripts/{YARA_TRIAGE_HELPER.name}"
+    guest_yara_ruleset = f"{guest_run_dir}/bundled_support/rules/yara/{BUNDLED_YARA_RULESET.name}"
     run_dir_hint = staged_run_dir / "analysis_vm_stage.json"
     run_dir_hint.write_text(json.dumps({
         "analysis_vm": args.analysis_vm,
@@ -997,6 +1190,8 @@ def run_analysis_in_analysis_vm(args: argparse.Namespace, run_dir: Path) -> Path
             [
                 "-lc",
                 " ".join([
+                    f"TRASHCAN_YARA_TRIAGE_HELPER={shlex.quote(guest_helper)}",
+                    f"TRASHCAN_BUNDLED_YARA_RULESET={shlex.quote(guest_yara_ruleset)}",
                     "python3",
                     guest_script,
                     "--parse-only",
@@ -1360,15 +1555,20 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
     suspicious_http_events = summary.get("suspicious_http_events", [])
     suricata_alerts = summary.get("suricata_alerts", [])
     static_iocs = summary.get("static_iocs", {})
+    yara_triage = summary.get("yara_triage", {})
     behaviors = summary.get("behaviors", [])
     dropped_files = summary.get("dropped_files", [])
     autoruns = summary.get("autoruns", [])
     artifact_files = summary.get("artifact_files", [])
-    generated = ["rule.yar"]
+    generated = ["rule.yar", "yara_triage_summary.json", "yara_triage_hits.txt"]
     if (run_dir / "sigma_dns.yml").exists():
         generated.append("sigma_dns.yml")
     if (run_dir / "sigma_behavior.yml").exists():
         generated.append("sigma_behavior.yml")
+    if (run_dir / "sigma_yara_family.yml").exists():
+        generated.append("sigma_yara_family.yml")
+    if (run_dir / "kql_triage_hunts.kql").exists():
+        generated.append("kql_triage_hunts.kql")
     suspicious_domains_text = chr(10).join(f'- `{d}`' for d in suspicious_domains) if suspicious_domains else '- None observed'
     dns_queries_text = chr(10).join(f'- `{d}`' for d in dns_queries) if dns_queries else '- None observed'
     tls_sni_text = chr(10).join(f'- `{d}`' for d in tls_sni) if tls_sni else '- None observed'
@@ -1397,6 +1597,11 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
         if isinstance(dropped_files, list) and dropped_files else '- None observed'
     )
     static_iocs_text = json.dumps(static_iocs, indent=2) if static_iocs else '{}'
+    yara_triage_rules = yara_triage.get("matched_rules", []) if isinstance(yara_triage, dict) else []
+    yara_triage_text = (
+        chr(10).join(f'- `{name}`' for name in yara_triage_rules)
+        if yara_triage_rules else '- None observed'
+    )
     generated_text = chr(10).join(f'- `{name}`' for name in generated)
     artifact_files_text = (
         chr(10).join(f'- `{name}`' for name in artifact_files[:100])
@@ -1460,6 +1665,10 @@ Full fake-service hit count: `{len(http_events)}`
 
 {static_iocs_text}
 
+## Bundled YARA Triage Hits
+
+{yara_triage_text}
+
 ## Generated Detections
 
 {generated_text}
@@ -1508,6 +1717,7 @@ def parse_existing_run(args: argparse.Namespace) -> int:
         summary["static_iocs"] = triage.get("static_iocs", {})
     elif triage:
         summary["static_iocs"] = triage.get("static_iocs", {})
+    summary["yara_triage"] = run_bundled_yara_triage(run_dir, sample)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     make_rules(run_dir, sample_sha256, summary, triage)
     report = write_report(args, run_dir, sample, sample_sha256, summary)
@@ -1649,6 +1859,7 @@ def main() -> int:
         else:
             summary = parse_artifacts(current_run_dir, pcap)
             summary["static_iocs"] = triage.get("static_iocs", {})
+            summary["yara_triage"] = run_bundled_yara_triage(current_run_dir, sample)
             summary_path = current_run_dir / "summary.json"
             summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
             make_rules(current_run_dir, sample_sha256, summary, triage)

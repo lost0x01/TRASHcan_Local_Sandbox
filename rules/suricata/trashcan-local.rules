@@ -1,0 +1,17 @@
+alert dns $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Dynamic DNS Domain Query"; dns.query; pcre:"/\.(duckdns\.org|ddns\.net|hopto\.org|myftp\.org|no-ip\.(?:biz|com|info|org))$/i"; classtype:trojan-activity; sid:4200001; rev:2;)
+
+alert dns $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Malware Staging Or C2 DNS Query"; dns.query; pcre:"/(?:pastebin\.com|pastebinusercontent\.com|discord(?:app)?\.com|discordcdn\.com|cdn-?discordapp\.com|transfer\.sh)$/i"; classtype:trojan-activity; sid:4200004; rev:1;)
+
+alert dns $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Ransomware Leaksite Or Negotiation DNS Query"; dns.query; pcre:"/(?:lockbit|blackbasta|alphv|clop|play|8base).{0,20}\.(?:onion|top|live|site|cc)$/i"; classtype:trojan-activity; sid:4200008; rev:1;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious PowerShell Downloader URI"; flow:established,to_server; http.uri; pcre:"/(frombase64string|downloadstring|invoke-expression|encodedcommand|iex%20|powershell%20-enc)/Ui"; classtype:trojan-activity; sid:4200002; rev:1;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Loader Staging URI Pattern"; flow:established,to_server; http.uri; pcre:"/(\/gate\.php|\/panel\/gate|\/api\/v1\/download|\/dl\/payload|\.dat\?id=)/Ui"; classtype:trojan-activity; sid:4200009; rev:1;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Stealer Exfiltration Pattern"; flow:established,to_server; http.host; pcre:"/(?:api\.telegram\.org|discord(?:app)?\.com|discord\.com|telegram\.org)$/i"; classtype:trojan-activity; sid:4200010; rev:1;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Automation Or Bot User-Agent"; flow:established,to_server; http.user_agent; content:"curl/"; nocase; classtype:trojan-activity; sid:4200005; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Automation Or Bot User-Agent"; flow:established,to_server; http.user_agent; content:"python-requests"; nocase; classtype:trojan-activity; sid:4200006; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Automation Or Bot User-Agent"; flow:established,to_server; http.user_agent; content:"TelegramBot"; nocase; classtype:trojan-activity; sid:4200007; rev:1;)
+
+alert tls $HOME_NET any -> $EXTERNAL_NET any (msg:"TRASHcan Suspicious Tunnel Or RMM TLS SNI"; tls.sni; pcre:"/(?:ngrok-free\.app|trycloudflare\.com|tailscale\.net|anydesk\.com|screenconnect\.com|rustdesk\.com|rustdesk\.net)$/i"; classtype:trojan-activity; sid:4200003; rev:2;)

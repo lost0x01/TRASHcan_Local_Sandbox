@@ -11,10 +11,14 @@ This repository is designed for defenders and researchers who want a reproducibl
 - Fake HTTP on `80/8080` and HTTPS on `443`
 - PCAP capture with `tshark`
 - Per-run Suricata validation and capture
+- Bundled custom Suricata rules for suspicious dynamic DNS, PowerShell downloaders, and tunnel/RMM TLS SNI patterns
+- Host-side Suricata runs now inherit the bundled repo ruleset plus run-local `.pw` heuristics
 - Windows guest collection for processes, services, tasks, WMI, autoruns, recent files, EVTX logs, and optional memory dumps
 - Sysmon-oriented behavior parsing
-- REMnux-offloaded static triage, PCAP parsing, and report regeneration via VirtualBox Guest Control
-- Auto-generated `summary.json`, `behavior_summary.json`, `analysis.md`, YARA, and Sigma detections
+- REMnux-offloaded static triage, PCAP parsing, bundled YARA rescanning, and report regeneration via VirtualBox Guest Control
+- Auto-generated `summary.json`, `behavior_summary.json`, `analysis.md`, YARA, Sigma, and KQL detections
+- Bundled reusable YARA triage rules for encoded PowerShell, LOLBIN droppers, and ransomware disruption strings
+- Automatic bundled YARA triage over the staged sample and extracted guest artifacts during report generation / reparse
 - `--parse-only` / `--report-only` mode for reprocessing completed runs
 
 ## Safety Model
@@ -75,9 +79,38 @@ src/raiccoon_sandbox/       Python runner and parser
 scripts/                    Guest/host setup helpers
 configs/                    Example local configuration
 docs/                       Rebuild, operations, and safety docs
+rules/                      Bundled Suricata and YARA rulesets
 tests/                      Unit tests for parser and rule behavior
 examples/                   Non-malicious example outputs/templates
 ```
+
+## Bundled Rulesets
+
+- Suricata: `rules/suricata/trashcan-local.rules`
+  - suspicious dynamic DNS providers often seen in opportunistic malware and throwaway C2
+  - suspicious staging/C2 domains such as paste sites, Discord-hosted delivery, and transfer services
+  - PowerShell downloader / encoded-command patterns in HTTP URIs
+  - suspicious HTTP user-agents from common automation or bot tooling
+  - TLS SNI hits for common tunnel or remote-management infrastructure
+  - family-focused heuristics for stealer exfil, loader staging URIs, and ransomware leaksite/negotiation domains
+- YARA: `rules/yara/trashcan_static_triage.yar`
+  - encoded PowerShell execution artifacts
+  - LOLBIN downloader / script launcher strings
+  - ransomware recovery-disruption command strings
+  - remote-access / tunnel tooling artifacts
+  - credential-access / LSASS-targeting artifacts
+  - family-focused stealer, loader/stager, and ransom-note artifacts
+
+Helper script:
+- `scripts/run_yara_triage.sh <path>` recursively scans a sample directory or extracted artifact tree with the bundled YARA ruleset.
+
+Pipeline integration:
+- local host-side analysis now writes `yara_triage_summary.json` and `yara_triage_hits.txt` for both fresh runs and `--parse-only` / `--report-only` reparses
+- REMnux-offloaded parse/report runs now stage the bundled YARA helper plus ruleset into the analysis share and regenerate the same `yara_triage_summary.json` / `yara_triage_hits.txt` outputs explicitly on the analysis side
+- host-side Suricata now builds `suricata_local.rules` from the repo-bundled ruleset plus run-local heuristics before validation/start
+- generated detections now include family-focused `sigma_yara_family.yml` and `kql_triage_hunts.kql` when bundled YARA triage hits are present
+
+The REMnux setup helper now installs the custom Suricata ruleset into `/etc/suricata/rules/trashcan-local.rules`, the bundled YARA triage rules into `/opt/trashcan/rules/yara/trashcan_static_triage.yar`, and the helper script into `/opt/trashcan/scripts/run_yara_triage.sh`.
 
 ## Required Host Tools
 
