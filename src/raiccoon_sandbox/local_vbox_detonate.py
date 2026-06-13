@@ -16,6 +16,7 @@ This is the REMnux + Windows path for the local RAIccoon lab:
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import http.server
@@ -1544,8 +1545,134 @@ def parse_guest_artifacts(run_dir: Path) -> dict[str, object]:
     return derived
 
 
+def markdown_code_block(text: str, language: str = "text") -> str:
+    body = (text or "").strip()
+    if not body:
+        body = "None observed"
+    return f"```{language}\n{body}\n```"
+
+
+def truncate_lines(text: str, limit: int = 40) -> str:
+    lines = (text or "").splitlines()
+    if len(lines) <= limit:
+        return "\n".join(lines).strip()
+    head = "\n".join(lines[:limit]).strip()
+    return f"{head}\n... ({len(lines) - limit} more lines omitted)"
+
+
+def truncate_text(value: object, limit: int = 140) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def process_tree_rows(process_tree: object, limit: int = 30) -> list[dict[str, str]]:
+    if not isinstance(process_tree, list):
+        return []
+    items = [item for item in process_tree if isinstance(item, dict)]
+    pid_to_name = {str(item.get("ProcessId", "")): str(item.get("Name", "")) for item in items}
+    items.sort(key=lambda item: (str(item.get("CreationDate", "")), str(item.get("ProcessId", ""))))
+    rows: list[dict[str, str]] = []
+    for item in items[:limit]:
+        pid = str(item.get("ProcessId", ""))
+        ppid = str(item.get("ParentProcessId", ""))
+        rows.append({
+            "pid": pid,
+            "ppid": ppid,
+            "name": str(item.get("Name", "")),
+            "parent_name": pid_to_name.get(ppid, "unknown") if ppid else "none",
+            "command_line": truncate_text(item.get("CommandLine", ""), 180),
+        })
+    return rows
+
+
+def process_tree_markdown(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "- No guest process tree was collected"
+    header = [
+        "| Step | Parent | Child | PID | PPID | Command Line |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    body = []
+    for idx, row in enumerate(rows, 1):
+        cmd = row["command_line"].replace("|", "\\|") if row["command_line"] else "n/a"
+        body.append(
+            f"| {idx} | `{row['parent_name'] or 'unknown'}` | `{row['name'] or 'unknown'}` | `{row['pid'] or 'n/a'}` | `{row['ppid'] or 'n/a'}` | `{cmd}` |"
+        )
+    return "\n".join(header + body)
+
+
+def write_process_tree_summary(run_dir: Path, rows: list[dict[str, str]]) -> Path:
+    path = run_dir / "process_tree_summary.md"
+    path.write_text("# Process Tree Summary\n\n" + process_tree_markdown(rows) + "\n", encoding="utf-8")
+    return path
+
+
+def collect_ioc_rows(sample_sha256: str, summary: dict[str, object]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    def add_row(ioc_type: str, value: object, source: str, context: str) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        rows.append({"type": ioc_type, "value": text, "source": source, "context": context})
+
+    add_row("sha256", sample_sha256, "sample", "primary sample sha256")
+    static_iocs = summary.get("static_iocs", {})
+    if isinstance(static_iocs, dict):
+        for kind, values in static_iocs.items():
+            if isinstance(values, list):
+                for value in values:
+                    add_row(str(kind), value, "static_triage", f"static triage extracted {kind}")
+    for domain in ensure_list(summary.get("dns_queries")):
+        add_row("domain", domain, "dynamic_dns", "dns query observed during sandbox run")
+    for domain in ensure_list(summary.get("tls_sni")):
+        add_row("domain", domain, "dynamic_tls", "tls sni observed during sandbox run")
+    for domain in ensure_list(summary.get("suspicious_domains")):
+        add_row("domain", domain, "sandbox_summary", "domain marked suspicious by sandbox triage")
+    for request in ensure_list(summary.get("http_requests")):
+        if isinstance(request, dict):
+            add_row("url", f"{request.get('host', '')}{request.get('uri', '')}", "dynamic_http", f"http request via {request.get('method', '') or 'unknown'}")
+    for item in ensure_list(summary.get("dropped_files")):
+        if isinstance(item, dict):
+            add_row("file_path", item.get("Path", ""), "guest_artifacts", "recently written or dropped file path")
+            add_row("sha256", item.get("SHA256", ""), "guest_artifacts", f"hash for dropped/recent file {item.get('Path', '')}")
+    for item in ensure_list(summary.get("autoruns")):
+        if isinstance(item, dict):
+            add_row("registry_key", item.get("key", ""), "autoruns", f"autorun key {item.get('name', '')}")
+            add_row("registry_data", item.get("data", ""), "autoruns", f"autorun data for {item.get('name', '')}")
+    yara_triage = summary.get("yara_triage", {})
+    if isinstance(yara_triage, dict):
+        for match in yara_triage.get("matches", []):
+            if isinstance(match, dict):
+                add_row("yara_match", match.get("rule", ""), "bundled_yara", f"matched against {match.get('target', '')}")
+
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (row["type"], row["value"], row["source"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def write_full_ioc_csv(run_dir: Path, sample_sha256: str, summary: dict[str, object]) -> Path:
+    path = run_dir / "iocs_full.csv"
+    rows = collect_ioc_rows(sample_sha256, summary)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["type", "value", "source", "context"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
 def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_sha256: str, summary: dict[str, object]) -> Path:
     report = run_dir / "analysis.md"
+    triage = load_json_file(run_dir / "static_triage.json")
+    triage = triage if isinstance(triage, dict) else {}
     dns_queries = summary.get("dns_queries", [])
     suspicious_domains = summary.get("suspicious_domains", [])
     tls_sni = summary.get("tls_sni", [])
@@ -1560,7 +1687,10 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
     dropped_files = summary.get("dropped_files", [])
     autoruns = summary.get("autoruns", [])
     artifact_files = summary.get("artifact_files", [])
-    generated = ["rule.yar", "yara_triage_summary.json", "yara_triage_hits.txt"]
+    process_rows = process_tree_rows(summary.get("process_tree", []))
+    process_tree_summary_path = write_process_tree_summary(run_dir, process_rows)
+    ioc_csv_path = write_full_ioc_csv(run_dir, sample_sha256, summary)
+    generated = ["rule.yar", "yara_triage_summary.json", "yara_triage_hits.txt", process_tree_summary_path.name, ioc_csv_path.name]
     if (run_dir / "sigma_dns.yml").exists():
         generated.append("sigma_dns.yml")
     if (run_dir / "sigma_behavior.yml").exists():
@@ -1598,16 +1728,24 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
     )
     static_iocs_text = json.dumps(static_iocs, indent=2) if static_iocs else '{}'
     yara_triage_rules = yara_triage.get("matched_rules", []) if isinstance(yara_triage, dict) else []
-    yara_triage_text = (
-        chr(10).join(f'- `{name}`' for name in yara_triage_rules)
-        if yara_triage_rules else '- None observed'
-    )
+    yara_triage_text = chr(10).join(f'- `{name}`' for name in yara_triage_rules) if yara_triage_rules else '- None observed'
     generated_text = chr(10).join(f'- `{name}`' for name in generated)
     artifact_files_text = (
         chr(10).join(f'- `{name}`' for name in artifact_files[:100])
         if isinstance(artifact_files, list) and artifact_files else '- No guest artifact archive was parsed'
     )
-    body = f"""# Local Sandbox Run - {sample_sha256[:12]}
+    rabin2_info_text = truncate_lines(str(triage.get("rabin2_info", "")), 35)
+    rabin2_sections_text = truncate_lines(str(triage.get("rabin2_sections", "")), 35)
+    rabin2_imports_text = truncate_lines(str(triage.get("rabin2_imports", "")), 40)
+    file_summary = truncate_text(triage.get("file", ""), 220)
+    detection_snippets = []
+    for detection_file, language in (("sigma_dns.yml", "yaml"), ("sigma_behavior.yml", "yaml"), ("sigma_yara_family.yml", "yaml"), ("rule.yar", "yara"), ("kql_triage_hunts.kql", "kusto")):
+        path = run_dir / detection_file
+        if path.exists():
+            detection_snippets.append(f"### {detection_file}\n\n{markdown_code_block(truncate_lines(path.read_text(encoding='utf-8', errors='replace'), 60), language)}")
+    detection_snippets_text = "\n\n".join(detection_snippets) if detection_snippets else "No generated detections were written for this run."
+    ioc_rows = collect_ioc_rows(sample_sha256, summary)
+    body = f"""# Local Sandbox Malware Analysis Draft - {sample_sha256[:12]}
 
 - Timestamp: {dt.datetime.now(dt.UTC).isoformat()}
 - VM: `{args.vm}`
@@ -1621,73 +1759,139 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
 - Sample file: `{sample.name}`
 - PCAP: `{(run_dir / 'capture.pcapng').name}`
 
-## Suspicious Domains
+## 1. Executive Summary
+
+This TRASHcan run produced an evidence-backed malware-analysis draft for `{sample.name}` using local sandbox telemetry, static triage, bundled YARA family matching, and generated detection content. Treat this output as source material for a final Lost Boys Cyber report rather than a finished client deliverable.
+
+## 2. Sample Metadata
+
+| Field | Value |
+| --- | --- |
+| Sample SHA256 | `{sample_sha256}` |
+| Sample SHA1 | `{triage.get('sha1', 'n/a')}` |
+| Sample MD5 | `{triage.get('md5', 'n/a')}` |
+| Approximate Size | `{triage.get('size', sample.stat().st_size if sample.exists() else 'unknown')}` bytes |
+| File Type | `{file_summary or 'n/a'}` |
+| Execution VM | `{args.vm}` |
+| Analysis Path | `{args.analysis_vm if analysis_vm_enabled(args) else 'local-host'}` |
+
+## 3. Static Analysis
+
+### 3.1 File and Build Characteristics
+
+- `file` classification: `{file_summary or 'n/a'}`
+- Static strings output: `strings.txt`
+- Full static triage JSON: `static_triage.json`
+
+### 3.2 rabin2 Metadata
+
+{markdown_code_block(rabin2_info_text, 'text')}
+
+### 3.3 Section Layout
+
+{markdown_code_block(rabin2_sections_text, 'text')}
+
+## 4. Code Analysis and Embedded Artefacts
+
+### 4.1 Imports and Logic Clues
+
+{markdown_code_block(rabin2_imports_text, 'text')}
+
+### 4.2 Bundled YARA Triage Hits
+
+{yara_triage_text}
+
+## 5. Dynamic Analysis
+
+### 5.1 Behavioral Findings
+
+{behaviors_text}
+
+### 5.2 Dropped / Recently Modified Files
+
+{dropped_files_text}
+
+### 5.3 Autoruns and Persistence-Relevant Registry Data
+
+{autoruns_text}
+
+## 6. Process Tree and Execution Chain
+
+The curated process-tree summary was written to `{process_tree_summary_path.name}`.
+
+{process_tree_markdown(process_rows)}
+
+## 7. Network and Infrastructure Analysis
+
+### 7.1 Suspicious Domains
 
 {suspicious_domains_text}
 
-## DNS Queries
+### 7.2 DNS Queries
 
 {dns_queries_text}
 
-## TLS SNI
+### 7.3 TLS SNI
 
 {tls_sni_text}
 
-## HTTP Requests
+### 7.4 HTTP Requests
 
 {suspicious_http_requests_text}
 
 Full HTTP request count: `{len(http_requests)}`
 
-## Fake HTTP/HTTPS Hits
+### 7.5 Fake HTTP/HTTPS Hits
 
 {suspicious_http_events_text}
 
 Full fake-service hit count: `{len(http_events)}`
 
-## Suricata Alerts
+### 7.6 Suricata Alerts
 
 {suricata_alerts_text}
 
-## Behavioral Findings
+## 8. Full IOC Summary
 
-{behaviors_text}
+- Total normalized IOC rows written to `{ioc_csv_path.name}`: `{len(ioc_rows)}`
+- Full machine-readable IOC coverage is stored in CSV form for downstream enrichment or upload.
 
-## Autoruns
+### 8.1 Static IOC JSON Excerpt
 
-{autoruns_text}
+{markdown_code_block(static_iocs_text, 'json')}
 
-## Dropped / Recently Modified Files
+## 9. Detection Engineering
 
-{dropped_files_text}
-
-## Static IOC Summary
-
-{static_iocs_text}
-
-## Bundled YARA Triage Hits
-
-{yara_triage_text}
-
-## Generated Detections
+TRASHcan generated the following detection artefacts automatically:
 
 {generated_text}
 
-## Guest Artifact Inventory
+### 9.1 Detection Content
+
+{detection_snippets_text}
+
+## 10. Threat Hunting
+
+- Hunt for the bundled YARA family themes in endpoint telemetry using `kql_triage_hunts.kql`.
+- Pivot from suspicious domains, direct-IP connections, dropped files, autoruns, and process-tree anomalies captured in this run.
+- If the sample behaved like a loader or access implant, scope adjacent hosts for similar parent-child chains and follow-on persistence.
+
+## 11. Guest Artifact Inventory
 
 {artifact_files_text}
 
-## Guest Telemetry Setup
+## 12. Guest Telemetry Setup
 
 - `guest_setup.ps1` prepares Sysmon/Defender settings inside the clean Windows snapshot.
 - `guest_collect.ps1` exports EVTX/process/network/registry artifacts once Guest Control is available or when run manually in the guest.
 - `behavior_summary.json` contains parsed guest-side persistence, dropped-file, and Sysmon summaries when artifacts are available.
 
-## Notes
+## 13. Analyst Notes and Next Steps
 
 - DNS is wildcarded to `{args.host_ip}` by `dnsmasq`.
 - HTTP ports 80/8080 and HTTPS port 443 are simulated locally when available.
 - Guest Control is used when available; mounted ISO and keyboard injection remain as fallback.
+- Use this draft as source material for a final Lost Boys Cyber malware report with deeper narrative interpretation, ATT&CK mapping, and client-specific validation.
 """
     report.write_text(body, encoding="utf-8")
     return report
