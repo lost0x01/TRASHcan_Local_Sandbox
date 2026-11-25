@@ -19,6 +19,7 @@ import argparse
 import csv
 import datetime as dt
 import hashlib
+import math
 import http.server
 import ipaddress
 import json
@@ -393,6 +394,380 @@ def static_triage(sample: Path, run_dir: Path) -> dict[str, object]:
     triage["static_iocs"] = static_iocs
     (run_dir / "static_triage.json").write_text(json.dumps(triage, indent=2, sort_keys=True), encoding="utf-8")
     return triage
+
+
+def entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for byte in data:
+        counts[byte] += 1
+    total = len(data)
+    return round(-sum((count / total) * math.log2(count / total) for count in counts if count), 4)
+
+
+def looks_base64_or_encoded(value: str) -> bool:
+    stripped = re.sub(r"\s+", "", value)
+    return len(stripped) >= 40 and bool(re.fullmatch(r"[A-Za-z0-9+/=]+", stripped))
+
+
+def classify_static_strings(strings: list[str]) -> dict[str, list[str]]:
+    blob = "\n".join(strings)
+    findings = {
+        "urls": sorted(set(IOC_PATTERNS["url"].findall(blob)))[:200],
+        "domains": [],
+        "ipv4": sorted(set(IOC_PATTERNS["ipv4"].findall(blob)))[:200],
+        "registry_keys": sorted(set(IOC_PATTERNS["registry_key"].findall(blob)))[:200],
+        "windows_paths": sorted(set(IOC_PATTERNS["windows_path"].findall(blob)))[:200],
+        "encoded_or_base64": [],
+        "commands": [],
+        "suspicious_keywords": [],
+    }
+    domains = []
+    for value in sorted(set(IOC_PATTERNS["domain"].findall(blob))):
+        if is_suspicious_domain(value) and not value.lower().endswith(".dll"):
+            domains.append(value)
+    findings["domains"] = domains[:200]
+    command_tokens = ("powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "certutil", "bitsadmin", "wmic", "schtasks")
+    keyword_tokens = ("lsass", "mimikatz", "procdump", "vssadmin", "shadowcopy", "anydesk", "rustdesk", "screenconnect", "telegram", "discord")
+    for value in strings:
+        low = value.lower()
+        if looks_base64_or_encoded(value) or "frombase64string" in low or "encodedcommand" in low or " -enc" in low:
+            findings["encoded_or_base64"].append(value[:500])
+        if any(token in low for token in command_tokens):
+            findings["commands"].append(value[:500])
+        if any(token in low for token in keyword_tokens):
+            findings["suspicious_keywords"].append(value[:500])
+    for key in ("encoded_or_base64", "commands", "suspicious_keywords"):
+        findings[key] = sorted(set(findings[key]))[:100]
+    return findings
+
+
+def run_tool_json_or_text(cmd: list[str], timeout: int = 120) -> dict[str, object]:
+    tool = cmd[0]
+    if not shutil.which(tool):
+        return {"available": False, "command": cmd, "output": ""}
+    try:
+        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        return {"available": True, "command": cmd, "returncode": result.returncode, "output": result.stdout[:200000]}
+    except Exception as exc:
+        return {"available": True, "command": cmd, "error": str(exc), "output": ""}
+
+
+def build_static_analysis(sample: Path, run_dir: Path, triage: dict[str, object]) -> dict[str, object]:
+    data = sample.read_bytes() if sample.exists() else b""
+    strings = extract_strings(sample) if sample.exists() else []
+    string_findings = classify_static_strings(strings)
+    file_entropy = entropy(data)
+    packer_indicators = []
+    if file_entropy >= 7.2:
+        packer_indicators.append("high overall entropy")
+    lower_strings = "\n".join(strings).lower()
+    for marker in ("upx", "pyinstaller", "autoit", "themida", "vmprotect", ".net", "go buildid", "rust"):
+        if marker in lower_strings:
+            packer_indicators.append(marker)
+    suspicious_import_keywords = [
+        "virtualalloc", "writeprocessmemory", "createremotethread", "setwindowshookex",
+        "internetopen", "winhttp", "cryptprotect", "lsass", "regsetvalue", "createservice",
+    ]
+    rabin_imports = str(triage.get("rabin2_imports", "")).lower()
+    suspicious_imports = sorted({kw for kw in suspicious_import_keywords if kw in rabin_imports or kw in lower_strings})
+    capa = run_tool_json_or_text(["capa", "-j", str(sample)])
+    floss = run_tool_json_or_text(["floss", "--json", str(sample)])
+    static_analysis = {
+        "sample": {
+            "path": str(sample),
+            "name": sample.name,
+            "size": len(data),
+            "md5": triage.get("md5") or hashlib.md5(data).hexdigest(),
+            "sha1": triage.get("sha1") or hashlib.sha1(data).hexdigest(),
+            "sha256": triage.get("sha256") or hashlib.sha256(data).hexdigest(),
+            "file": triage.get("file", ""),
+            "entropy": file_entropy,
+        },
+        "pe_or_binary_metadata": {
+            "rabin2_info": triage.get("rabin2_info", ""),
+            "rabin2_sections": triage.get("rabin2_sections", ""),
+            "rabin2_imports": triage.get("rabin2_imports", ""),
+            "suspicious_import_keywords": suspicious_imports,
+        },
+        "string_iocs": string_findings,
+        "packer_assessment": {
+            "overall_entropy": file_entropy,
+            "indicators": sorted(set(packer_indicators)),
+            "assessment": "packed_or_obfuscated" if packer_indicators else "no_clear_packer_signal",
+        },
+        "tool_outputs": {
+            "capa": capa,
+            "floss": floss,
+        },
+    }
+    (run_dir / "static_analysis.json").write_text(json.dumps(static_analysis, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "string_iocs.json").write_text(json.dumps(string_findings, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "packer_assessment.json").write_text(json.dumps(static_analysis["packer_assessment"], indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "capa_report.json").write_text(json.dumps(capa, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "floss_strings.json").write_text(json.dumps(floss, indent=2, sort_keys=True), encoding="utf-8")
+    findings = [
+        "# Static Findings",
+        "",
+        f"- File type: {triage.get('file', 'n/a')}",
+        f"- Entropy: {file_entropy}",
+        f"- Packer assessment: {static_analysis['packer_assessment']['assessment']}",
+        f"- Suspicious import/string keywords: {', '.join(suspicious_imports) if suspicious_imports else 'none observed'}",
+        f"- Extracted URL count: {len(string_findings['urls'])}",
+        f"- Extracted suspicious domain count: {len(string_findings['domains'])}",
+        f"- Encoded/base64-like string count: {len(string_findings['encoded_or_base64'])}",
+    ]
+    (run_dir / "static_findings.md").write_text("\n".join(findings) + "\n", encoding="utf-8")
+    return static_analysis
+
+
+def build_process_tree_artifacts(run_dir: Path, summary: dict[str, object]) -> dict[str, object]:
+    rows = process_tree_rows(summary.get("process_tree", []), limit=500)
+    tree = {"processes": rows, "process_count": len(rows)}
+    (run_dir / "process_tree.json").write_text(json.dumps(tree, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "process_tree.txt").write_text("\n".join(f"{r['parent_name']}({r['ppid']}) -> {r['name']}({r['pid']}): {r['command_line']}" for r in rows) + ("\n" if rows else "No process tree collected\n"), encoding="utf-8")
+    (run_dir / "process_tree.md").write_text("# Process Tree\n\n" + process_tree_markdown(rows) + "\n", encoding="utf-8")
+    return tree
+
+
+def build_behavior_timeline(run_dir: Path, summary: dict[str, object]) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for event in ensure_list(summary.get("sysmon_process_events")):
+        if isinstance(event, dict):
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            events.append({"timestamp": event.get("timestamp", ""), "source": "sysmon", "type": "process_create", "detail": data.get("Image") or data.get("CommandLine") or data})
+    for event in ensure_list(summary.get("sysmon_file_create_events")):
+        if isinstance(event, dict):
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            events.append({"timestamp": event.get("timestamp", ""), "source": "sysmon", "type": "file_create", "detail": data.get("TargetFilename") or data})
+    for event in ensure_list(summary.get("sysmon_registry_events")):
+        if isinstance(event, dict):
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            events.append({"timestamp": event.get("timestamp", ""), "source": "sysmon", "type": "registry", "detail": data.get("TargetObject") or data})
+    for domain in ensure_list(summary.get("dns_queries")):
+        events.append({"timestamp": "", "source": "network", "type": "dns_query", "detail": domain})
+    for alert in ensure_list(summary.get("suricata_alerts")):
+        if isinstance(alert, dict):
+            events.append({"timestamp": alert.get("timestamp", ""), "source": "suricata", "type": "ids_alert", "detail": alert.get("alert", {}).get("signature", "alert")})
+    events.sort(key=lambda item: str(item.get("timestamp", "")))
+    (run_dir / "behavior_timeline.json").write_text(json.dumps(events, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "timeline.json").write_text(json.dumps(events, indent=2, sort_keys=True), encoding="utf-8")
+    with (run_dir / "timeline.csv").open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["timestamp", "source", "type", "detail"])
+        writer.writeheader()
+        for event in events:
+            writer.writerow({k: str(event.get(k, "")) for k in ("timestamp", "source", "type", "detail")})
+    md = ["# Behavior Timeline", ""] + [f"- `{e.get('timestamp') or 'n/a'}` {e.get('source')}/{e.get('type')}: `{truncate_text(e.get('detail'), 220)}`" for e in events[:500]]
+    if len(md) == 2:
+        md.append("- No timestamped events collected")
+    (run_dir / "timeline.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    return events
+
+
+def build_dynamic_analysis(run_dir: Path, summary: dict[str, object], process_tree: dict[str, object], timeline: list[dict[str, object]]) -> dict[str, object]:
+    dynamic = {
+        "guest_artifacts_present": summary.get("guest_artifacts_present", False),
+        "process_tree": process_tree,
+        "behavior_timeline_count": len(timeline),
+        "behaviors": summary.get("behaviors", []),
+        "dropped_files": summary.get("dropped_files", []),
+        "autoruns": summary.get("autoruns", []),
+        "persistence_mechanisms": [b for b in ensure_list(summary.get("behaviors")) if isinstance(b, dict) and "persist" in str(b.get("type", "") + b.get("description", "")).lower()],
+        "registry_changes": summary.get("sysmon_registry_events", []),
+        "filesystem_changes": summary.get("sysmon_file_create_events", []),
+    }
+    (run_dir / "dynamic_analysis.json").write_text(json.dumps(dynamic, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "registry_changes.json").write_text(json.dumps(dynamic["registry_changes"], indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "filesystem_changes.json").write_text(json.dumps(dynamic["filesystem_changes"], indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "persistence_mechanisms.json").write_text(json.dumps(dynamic["persistence_mechanisms"], indent=2, sort_keys=True), encoding="utf-8")
+    return dynamic
+
+
+def build_network_analysis(run_dir: Path, summary: dict[str, object]) -> dict[str, object]:
+    c2_candidates = []
+    for domain in ensure_list(summary.get("suspicious_domains")):
+        c2_candidates.append({"indicator": domain, "type": "domain", "score": 60, "reason": "suspicious DNS/TLS domain observed"})
+    for request in ensure_list(summary.get("suspicious_http_requests")):
+        if isinstance(request, dict):
+            c2_candidates.append({"indicator": f"{request.get('host', '')}{request.get('uri', '')}", "type": "http", "score": 70, "reason": "suspicious HTTP request observed"})
+    network = {
+        "dns_queries": summary.get("dns_queries", []),
+        "tls_sni": summary.get("tls_sni", []),
+        "http_requests": summary.get("http_requests", []),
+        "http_events": summary.get("http_events", []),
+        "suricata_alerts": summary.get("suricata_alerts", []),
+        "c2_candidates": c2_candidates,
+        "capinfos": summary.get("capinfos", ""),
+        "protocols": summary.get("protocols", ""),
+        "zeek": {"available": shutil.which("zeek") is not None, "note": "Zeek post-processing hook reserved for populated PCAP runs."},
+    }
+    (run_dir / "network_summary.json").write_text(json.dumps(network, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "network_flows.json").write_text(json.dumps({"http_requests": network["http_requests"], "tls_sni": network["tls_sni"], "dns_queries": network["dns_queries"]}, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "c2_candidates.json").write_text(json.dumps(c2_candidates, indent=2, sort_keys=True), encoding="utf-8")
+    return network
+
+
+def build_memory_analysis(run_dir: Path) -> dict[str, object]:
+    memory_path = run_dir / "guest_artifacts" / "memory.raw"
+    if not memory_path.exists():
+        memory_path = run_dir / "memory.raw"
+    result = {"memory_dump_present": memory_path.exists(), "memory_dump_path": str(memory_path) if memory_path.exists() else "", "volatility3_available": shutil.which("vol") is not None or shutil.which("volatility3") is not None, "plugins": {}}
+    if memory_path.exists():
+        vol = shutil.which("vol") or shutil.which("volatility3")
+        if vol:
+            for plugin in ("windows.pslist", "windows.pstree", "windows.cmdline", "windows.netscan", "windows.malfind"):
+                result["plugins"][plugin] = run_tool_json_or_text([vol, "-f", str(memory_path), plugin], timeout=180)
+    (run_dir / "memory_analysis.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "memory_network_connections.json").write_text(json.dumps(result.get("plugins", {}).get("windows.netscan", {}), indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "memory_malfind.txt").write_text(str(result.get("plugins", {}).get("windows.malfind", {}).get("output", "No memory dump or Volatility malfind output available.")), encoding="utf-8")
+    (run_dir / "memory_yara_hits.json").write_text(json.dumps({"matches": [], "note": "Memory YARA scanning is available when a dump and rules are configured."}, indent=2, sort_keys=True), encoding="utf-8")
+    return result
+
+
+def build_mitre_mapping(run_dir: Path, summary: dict[str, object], static_analysis: dict[str, object]) -> dict[str, object]:
+    mappings: list[dict[str, str]] = []
+    def add(technique: str, name: str, evidence: str) -> None:
+        if not any(m["technique"] == technique and m["evidence"] == evidence for m in mappings):
+            mappings.append({"technique": technique, "name": name, "evidence": evidence})
+    strings = static_analysis.get("string_iocs", {}) if isinstance(static_analysis.get("string_iocs"), dict) else {}
+    if strings.get("encoded_or_base64"):
+        add("T1059.001", "PowerShell", "encoded/base64 PowerShell-like strings")
+    if strings.get("commands"):
+        add("T1105", "Ingress Tool Transfer", "download or LOLBIN command strings")
+    for behavior in ensure_list(summary.get("behaviors")):
+        if isinstance(behavior, dict):
+            technique = str(behavior.get("technique", ""))
+            if technique:
+                add(technique.split("/")[0], str(behavior.get("type", "Observed Behavior")), str(behavior.get("description", "")))
+    if summary.get("suspicious_domains") or summary.get("tls_sni"):
+        add("T1071", "Application Layer Protocol", "network communication observed")
+    mapping = {"techniques": mappings, "count": len(mappings)}
+    (run_dir / "mitre_attack_mapping.json").write_text(json.dumps(mapping, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "mitre_attack_matrix.md").write_text("# MITRE ATT&CK Mapping\n\n" + ("\n".join(f"- `{m['technique']}` {m['name']}: {m['evidence']}" for m in mappings) if mappings else "- No deterministic ATT&CK mapping produced") + "\n", encoding="utf-8")
+    return mapping
+
+
+def build_verdict_score(run_dir: Path, summary: dict[str, object], static_analysis: dict[str, object], network: dict[str, object], memory: dict[str, object], mitre: dict[str, object]) -> dict[str, object]:
+    reasons = []
+    score = 0
+    if static_analysis.get("packer_assessment", {}).get("indicators"):
+        score += 15; reasons.append("packer/obfuscation indicators")
+    string_iocs = static_analysis.get("string_iocs", {}) if isinstance(static_analysis.get("string_iocs"), dict) else {}
+    if string_iocs.get("encoded_or_base64") or string_iocs.get("commands"):
+        score += 20; reasons.append("suspicious static strings or commands")
+    if summary.get("behaviors"):
+        score += 30; reasons.append("dynamic behavioral findings")
+    if network.get("c2_candidates"):
+        score += 25; reasons.append("network C2 candidates")
+    if summary.get("suricata_alerts"):
+        score += 25; reasons.append("IDS alerts")
+    if memory.get("memory_dump_present"):
+        score += 5; reasons.append("memory artifact available for review")
+    if mitre.get("count", 0):
+        score += min(20, int(mitre.get("count", 0)) * 5); reasons.append("ATT&CK techniques mapped")
+    if score >= 70:
+        verdict = "malicious"
+    elif score >= 25:
+        verdict = "suspicious"
+    elif summary.get("guest_artifacts_present") or summary.get("dns_queries"):
+        verdict = "benign"
+    else:
+        verdict = "inconclusive"
+    result = {"score": min(score, 100), "verdict": verdict, "confidence": min(round(score / 100, 2), 0.99), "reasons": reasons or ["limited observable evidence"]}
+    (run_dir / "verdict_score.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return result
+
+
+def build_run_metadata(args: argparse.Namespace, run_dir: Path, sample: Path, sample_sha256: str, summary: dict[str, object]) -> None:
+    tool_names = ["file", "rabin2", "capa", "floss", "yara", "yarac", "tshark", "capinfos", "suricata", "zeek", "vol", "volatility3", "VBoxManage"]
+    versions = {}
+    for name in tool_names:
+        path = shutil.which(name)
+        versions[name] = {"path": path or "", "available": bool(path)}
+        if path:
+            versions[name]["version"] = run([path, "--version"], check=False).stdout[:500]
+    manifest = {
+        "run_dir": str(run_dir),
+        "generated_at": dt.datetime.now(dt.UTC).isoformat(),
+        "sample": {"name": sample.name, "sha256": sample_sha256, "path": str(sample)},
+        "vm": getattr(args, "vm", ""),
+        "snapshot": getattr(args, "snapshot", ""),
+        "guest_ip": getattr(args, "guest_ip", ""),
+        "analysis_service_ip": getattr(args, "analysis_service_ip", ""),
+        "privacy_guardrails": {"company_model": "private_single_client", "allow_public_enrichment": False, "public_uploads_allowed": False, "default_tlp": "TLP:AMBER"},
+        "artifact_counts": {"dns_queries": len(ensure_list(summary.get("dns_queries"))), "behaviors": len(ensure_list(summary.get("behaviors"))), "suricata_alerts": len(ensure_list(summary.get("suricata_alerts")))},
+    }
+    (run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "sandbox_config.json").write_text(json.dumps({"vm": manifest["vm"], "snapshot": manifest["snapshot"], "network": {"guest_ip": manifest["guest_ip"], "analysis_service_ip": manifest["analysis_service_ip"]}}, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "tool_versions.json").write_text(json.dumps(versions, indent=2, sort_keys=True), encoding="utf-8")
+    custody = {"sample_sha256": sample_sha256, "run_dir": str(run_dir), "artifact_hashes": {}}
+    for path in sorted(p for p in run_dir.rglob("*") if p.is_file() and p.stat().st_size < 100 * 1024 * 1024):
+        if ".git" in path.parts:
+            continue
+        try:
+            custody["artifact_hashes"][str(path.relative_to(run_dir))] = sha256_file(path)
+        except Exception:
+            pass
+    (run_dir / "chain_of_custody.json").write_text(json.dumps(custody, indent=2, sort_keys=True), encoding="utf-8")
+    (run_dir / "environment.json").write_text(json.dumps({"platform": sys.platform, "python": sys.version, "cwd": os.getcwd()}, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def safe_copy_artifact(src: Path, dst: Path) -> None:
+    if src.exists() and src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def package_report_bundle(run_dir: Path, report: Path) -> None:
+    groups = {
+        "static": ["static_analysis.json", "static_triage.json", "string_iocs.json", "packer_assessment.json", "static_findings.md", "capa_report.json", "floss_strings.json", "yara_triage_summary.json", "yara_triage_hits.txt"],
+        "dynamic": ["dynamic_analysis.json", "process_tree.json", "process_tree.md", "process_tree.txt", "behavior_timeline.json", "timeline.json", "timeline.csv", "timeline.md", "registry_changes.json", "filesystem_changes.json", "persistence_mechanisms.json", "behavior_summary.json"],
+        "network": ["capture.pcapng", "network_summary.json", "network_flows.json", "c2_candidates.json", "suricata_eve.json"],
+        "memory": ["memory_analysis.json", "memory_network_connections.json", "memory_malfind.txt", "memory_yara_hits.json", "memory.raw"],
+        "detections": ["rule.yar", "sigma_dns.yml", "sigma_behavior.yml", "sigma_yara_family.yml", "kql_triage_hunts.kql", "iocs_full.csv", "mitre_attack_mapping.json", "mitre_attack_matrix.md"],
+        "evidence": ["guest_artifacts.zip", "chain_of_custody.json", "tool_versions.json", "environment.json", "sandbox_config.json", "run_manifest.json"],
+        "reports": [report.name, "summary.json", "verdict_score.json"],
+    }
+    for directory, names in groups.items():
+        for name in names:
+            safe_copy_artifact(run_dir / name, run_dir / directory / name)
+    if report.name != "analysis.md":
+        safe_copy_artifact(report, run_dir / "reports" / report.name)
+    safe_copy_artifact(report, run_dir / "reports" / "analysis.md")
+    for screenshot in run_dir.glob("*.png"):
+        safe_copy_artifact(screenshot, run_dir / "evidence" / "screenshots" / screenshot.name)
+    manifest = load_json_file(run_dir / "run_manifest.json")
+    sample_sha256 = "unknown"
+    if isinstance(manifest, dict):
+        sample_meta = manifest.get("sample", {})
+        if isinstance(sample_meta, dict):
+            sample_sha256 = str(sample_meta.get("sha256", "unknown"))
+    custody = {"sample_sha256": sample_sha256, "run_dir": str(run_dir), "artifact_hashes": {}}
+    for path in sorted(p for p in run_dir.rglob("*") if p.is_file() and p.stat().st_size < 100 * 1024 * 1024):
+        rel = str(path.relative_to(run_dir))
+        if rel == "chain_of_custody.json" or rel == "evidence/chain_of_custody.json":
+            continue
+        try:
+            custody["artifact_hashes"][rel] = sha256_file(path)
+        except Exception:
+            pass
+    (run_dir / "chain_of_custody.json").write_text(json.dumps(custody, indent=2, sort_keys=True), encoding="utf-8")
+    safe_copy_artifact(run_dir / "chain_of_custody.json", run_dir / "evidence" / "chain_of_custody.json")
+
+
+def generate_reporting_artifacts(args: argparse.Namespace, run_dir: Path, sample: Path, sample_sha256: str, summary: dict[str, object], triage: dict[str, object]) -> dict[str, object]:
+    static_analysis = build_static_analysis(sample, run_dir, triage)
+    process_tree = build_process_tree_artifacts(run_dir, summary)
+    timeline = build_behavior_timeline(run_dir, summary)
+    dynamic = build_dynamic_analysis(run_dir, summary, process_tree, timeline)
+    network = build_network_analysis(run_dir, summary)
+    memory = build_memory_analysis(run_dir)
+    mitre = build_mitre_mapping(run_dir, summary, static_analysis)
+    verdict = build_verdict_score(run_dir, summary, static_analysis, network, memory, mitre)
+    summary.update({"static_analysis": static_analysis, "dynamic_analysis": dynamic, "network_analysis": network, "memory_analysis": memory, "mitre_attack": mitre, "verdict_score": verdict})
+    build_run_metadata(args, run_dir, sample, sample_sha256, summary)
+    return summary
 
 
 def make_rules(run_dir: Path, sample_sha256: str, summary: dict[str, object], triage: dict[str, object]) -> None:
@@ -1209,6 +1584,8 @@ def run_analysis_in_analysis_vm(args: argparse.Namespace, run_dir: Path) -> Path
                     shlex.quote(args.host_ip),
                     "--guest-ip",
                     shlex.quote(args.guest_ip),
+                    "--service-level",
+                    shlex.quote(getattr(args, "service_level", "standard")),
                 ]),
             ],
             timeout=max(300, args.duration + 180),
@@ -1744,6 +2121,25 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
         if path.exists():
             detection_snippets.append(f"### {detection_file}\n\n{markdown_code_block(truncate_lines(path.read_text(encoding='utf-8', errors='replace'), 60), language)}")
     detection_snippets_text = "\n\n".join(detection_snippets) if detection_snippets else "No generated detections were written for this run."
+    verdict_score = summary.get("verdict_score", {}) if isinstance(summary.get("verdict_score"), dict) else {}
+    mitre_attack = summary.get("mitre_attack", {}) if isinstance(summary.get("mitre_attack"), dict) else {}
+    mitre_techniques = mitre_attack.get("techniques", []) if isinstance(mitre_attack, dict) else []
+    mitre_text = (
+        chr(10).join(f"- `{m.get('technique')}` {m.get('name')}: {m.get('evidence')}" for m in mitre_techniques if isinstance(m, dict))
+        if isinstance(mitre_techniques, list) and mitre_techniques else '- No deterministic ATT&CK mapping produced'
+    )
+    network_analysis = summary.get("network_analysis", {}) if isinstance(summary.get("network_analysis"), dict) else {}
+    c2_candidates = network_analysis.get("c2_candidates", []) if isinstance(network_analysis, dict) else []
+    c2_candidates_text = (
+        chr(10).join(f"- `{c.get('indicator')}` score `{c.get('score')}` — {c.get('reason')}" for c in c2_candidates if isinstance(c, dict))
+        if isinstance(c2_candidates, list) and c2_candidates else '- None observed'
+    )
+    memory_analysis = summary.get("memory_analysis", {}) if isinstance(summary.get("memory_analysis"), dict) else {}
+    memory_text = (
+        f"- Memory dump present: `{memory_analysis.get('memory_dump_present', False)}`\n"
+        f"- Volatility 3 available: `{memory_analysis.get('volatility3_available', False)}`\n"
+        f"- Memory analysis JSON: `memory_analysis.json`"
+    )
     ioc_rows = collect_ioc_rows(sample_sha256, summary)
     body = f"""# Local Sandbox Malware Analysis Draft - {sample_sha256[:12]}
 
@@ -1761,7 +2157,12 @@ def write_report(args: argparse.Namespace, run_dir: Path, sample: Path, sample_s
 
 ## 1. Executive Summary
 
-This TRASHcan run produced an evidence-backed malware-analysis draft for `{sample.name}` using local sandbox telemetry, static triage, bundled YARA family matching, and generated detection content. Treat this output as source material for a final Lost Boys Cyber report rather than a finished client deliverable.
+This TRASHcan run produced an evidence-backed malware-analysis draft for `{sample.name}` using local sandbox telemetry, static triage, GhidraMCP/Ghidra-ready reverse-engineering evidence capture, bundled YARA family matching, generated detection content, deterministic scoring, and a private-client artifact bundle. Treat this output as source material for a final Lost Boys Cyber report rather than a finished client deliverable.
+
+- Deterministic verdict: `{verdict_score.get('verdict', 'unknown')}`
+- Evidence score: `{verdict_score.get('score', 'n/a')}`
+- Confidence: `{verdict_score.get('confidence', 'n/a')}`
+- Scoring reasons: `{', '.join(verdict_score.get('reasons', [])) if isinstance(verdict_score.get('reasons'), list) else verdict_score.get('reasons', 'n/a')}`
 
 ## 2. Sample Metadata
 
@@ -1800,6 +2201,12 @@ This TRASHcan run produced an evidence-backed malware-analysis draft for `{sampl
 ### 4.2 Bundled YARA Triage Hits
 
 {yara_triage_text}
+
+### 4.2 GhidraMCP / Ghidra Reverse-Engineering Follow-up
+
+- Use GhidraMCP for sample-backed code-level validation whenever Ghidra is available.
+- Preserve the Ghidra project path, imported program name, decompiled snippets, renamed functions/symbols, comments, xrefs, offsets, recovered config values, and any MCP transcript/summary notes under the final analyst-kit `notes/` or `evidence/` bundle.
+- If GhidraMCP is unavailable, document the blocker and use radare2/headless Ghidra output as the fallback evidence path.
 
 ## 5. Dynamic Analysis
 
@@ -1851,6 +2258,18 @@ Full fake-service hit count: `{len(http_events)}`
 
 {suricata_alerts_text}
 
+### 7.7 C2 Candidate Scoring
+
+{c2_candidates_text}
+
+## 7.8 Memory Analysis
+
+{memory_text}
+
+## 7.9 MITRE ATT&CK Mapping
+
+{mitre_text}
+
 ## 8. Full IOC Summary
 
 - Total normalized IOC rows written to `{ioc_csv_path.name}`: `{len(ioc_rows)}`
@@ -1886,7 +2305,19 @@ TRASHcan generated the following detection artefacts automatically:
 - `guest_collect.ps1` exports EVTX/process/network/registry artifacts once Guest Control is available or when run manually in the guest.
 - `behavior_summary.json` contains parsed guest-side persistence, dropped-file, and Sysmon summaries when artifacts are available.
 
-## 13. Analyst Notes and Next Steps
+## 13. Private Client Bundle and Guardrails
+
+- Canonical report bundle root: `reports/`, `static/`, `dynamic/`, `network/`, `memory/`, `detections/`, and `evidence/` under this run directory.
+- Public sample/artifact enrichment is disabled by default in `run_manifest.json`.
+- Default handling is private single-client / `TLP:AMBER`; do not upload live samples or artifacts to public services without explicit authorization.
+
+## 14. Recommendations
+
+- Keep source artifacts and intermediate analysis output in the run/analyst-kit area; copy only final client-ready reports into `RAIccoon_Reports`.
+- Treat public enrichment, public uploads, and third-party sharing as opt-in only after explicit client authorization.
+- Use `report_preflight.json`, `workflow_status.json`, and chain-of-custody artifacts as QA evidence before delivery.
+
+## 15. Analyst Notes and Next Steps
 
 - DNS is wildcarded to `{args.host_ip}` by `dnsmasq`.
 - HTTP ports 80/8080 and HTTPS port 443 are simulated locally when available.
@@ -1895,6 +2326,165 @@ TRASHcan generated the following detection artefacts automatically:
 """
     report.write_text(body, encoding="utf-8")
     return report
+
+
+SERVICE_LEVEL_PROFILES: dict[str, dict[str, object]] = {
+    "rapid-triage": {
+        "description": "Fast answer for initial client triage: malicious/suspicious/inconclusive, key evidence, and IOC highlights.",
+        "required_artifacts": ["analysis.md", "summary.json", "static_analysis.json", "iocs_full.csv", "verdict_score.json", "run_manifest.json"],
+        "required_sections": ["Executive Summary", "Sample Metadata", "IOC"],
+        "memory_analysis_required": False,
+        "minimum_score_for_client_ready": 60,
+    },
+    "standard": {
+        "description": "Normal Lost Boys Cyber malware-analysis deliverable with static, GhidraMCP/Ghidra reverse-engineering follow-up, dynamic, process-tree, network, IOC, ATT&CK, detection, and hunt coverage.",
+        "required_artifacts": [
+            "analysis.md", "summary.json", "static_analysis.json", "dynamic_analysis.json", "process_tree.json",
+            "network_summary.json", "iocs_full.csv", "verdict_score.json", "mitre_attack_mapping.json",
+            "run_manifest.json", "chain_of_custody.json",
+        ],
+        "required_sections": ["Executive Summary", "Sample Metadata", "Static Analysis", "Dynamic Analysis", "Process Tree", "IOC", "Detection Engineering", "Threat Hunting"],
+        "memory_analysis_required": False,
+        "minimum_score_for_client_ready": 80,
+    },
+    "deep-dive": {
+        "description": "High-impact or IR-support analysis with memory/reversing evidence, strong detections, and complete client-ready narrative.",
+        "required_artifacts": [
+            "analysis.md", "summary.json", "static_analysis.json", "dynamic_analysis.json", "process_tree.json",
+            "network_summary.json", "memory_analysis.json", "iocs_full.csv", "verdict_score.json",
+            "mitre_attack_mapping.json", "run_manifest.json", "chain_of_custody.json", "tool_versions.json",
+        ],
+        "required_sections": ["Executive Summary", "Sample Metadata", "Static Analysis", "Code Analysis", "Dynamic Analysis", "Process Tree", "Network", "Memory Analysis", "IOC", "MITRE", "Detection Engineering", "Threat Hunting", "Recommendations"],
+        "memory_analysis_required": True,
+        "minimum_score_for_client_ready": 90,
+    },
+}
+
+WORKFLOW_STATUSES = ["queued", "running", "triage-complete", "analysis-complete", "report-draft", "qa", "delivered", "blocked", "failed"]
+
+
+def service_level_profile(service_level: str) -> dict[str, object]:
+    key = service_level.lower().strip()
+    aliases = {"triage": "rapid-triage", "rapid": "rapid-triage", "standard-report": "standard", "deep": "deep-dive"}
+    key = aliases.get(key, key)
+    if key not in SERVICE_LEVEL_PROFILES:
+        raise ValueError(f"Unknown service level '{service_level}'. Valid values: {', '.join(SERVICE_LEVEL_PROFILES)}")
+    profile = dict(SERVICE_LEVEL_PROFILES[key])
+    profile["name"] = key
+    return profile
+
+
+def report_preflight(run_dir: Path, service_level: str = "standard", *, write_result: bool = True) -> dict[str, object]:
+    run_dir = run_dir.expanduser().resolve()
+    profile = service_level_profile(service_level)
+    required_artifacts = list(profile["required_artifacts"]) if isinstance(profile.get("required_artifacts"), list) else []
+    missing = [name for name in required_artifacts if not (run_dir / str(name)).exists()]
+    report_text = (run_dir / "analysis.md").read_text(encoding="utf-8", errors="replace") if (run_dir / "analysis.md").exists() else ""
+    required_sections = list(profile["required_sections"]) if isinstance(profile.get("required_sections"), list) else []
+    missing_sections = [section for section in required_sections if section.lower() not in report_text.lower()]
+    manifest = load_json_file(run_dir / "run_manifest.json")
+    guardrail_errors: list[str] = []
+    if isinstance(manifest, dict):
+        guardrails = manifest.get("privacy_guardrails", {})
+        if isinstance(guardrails, dict):
+            if guardrails.get("allow_public_enrichment") is not False:
+                guardrail_errors.append("run_manifest.json must set privacy_guardrails.allow_public_enrichment=false")
+            if guardrails.get("public_uploads_allowed") is not False:
+                guardrail_errors.append("run_manifest.json must set privacy_guardrails.public_uploads_allowed=false")
+        else:
+            guardrail_errors.append("run_manifest.json missing privacy_guardrails object")
+    elif "run_manifest.json" not in missing:
+        guardrail_errors.append("run_manifest.json is not valid JSON")
+    bundle_dirs = ["reports", "static", "dynamic", "network", "detections", "evidence"]
+    if profile.get("memory_analysis_required"):
+        bundle_dirs.append("memory")
+    missing_bundle_dirs = [name for name in bundle_dirs if not (run_dir / name).exists()]
+    score_errors: list[str] = []
+    score_data = load_json_file(run_dir / "verdict_score.json")
+    min_score = int(profile.get("minimum_score_for_client_ready", 0))
+    if isinstance(score_data, dict):
+        try:
+            score = int(score_data.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        verdict = str(score_data.get("verdict", "")).lower()
+        if score < min_score:
+            score_errors.append(f"verdict_score.json score {score} is below {profile['name']} threshold {min_score}")
+        if verdict in {"inconclusive", "unknown", ""} and profile["name"] != "rapid-triage":
+            score_errors.append(f"verdict '{verdict or 'missing'}' requires analyst review before {profile['name']} handoff")
+    elif "verdict_score.json" not in missing:
+        score_errors.append("verdict_score.json is not valid JSON")
+    result = {
+        "run_dir": str(run_dir),
+        "service_level": profile["name"],
+        "client_ready": not missing and not missing_sections and not guardrail_errors and not missing_bundle_dirs and not score_errors,
+        "missing_required_artifacts": missing,
+        "missing_report_sections": missing_sections,
+        "guardrail_errors": guardrail_errors,
+        "score_errors": score_errors,
+        "missing_bundle_dirs": missing_bundle_dirs,
+        "profile": profile,
+        "checked_at": dt.datetime.now(dt.UTC).isoformat(),
+    }
+    if write_result:
+        (run_dir / "report_preflight.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return result
+
+
+def update_workflow_status(run_dir: Path, status: str, note: str = "") -> dict[str, object]:
+    status = status.lower().strip()
+    if status not in WORKFLOW_STATUSES:
+        raise ValueError(f"Unknown workflow status '{status}'. Valid values: {', '.join(WORKFLOW_STATUSES)}")
+    run_dir = run_dir.expanduser().resolve()
+    path = run_dir / "workflow_status.json"
+    existing = load_json_file(path)
+    state = existing if isinstance(existing, dict) else {"history": []}
+    history = state.get("history", []) if isinstance(state.get("history", []), list) else []
+    history.append({"ts": dt.datetime.now(dt.UTC).isoformat(), "status": status, "note": note})
+    state.update({"run_dir": str(run_dir), "current_status": status, "note": note, "history": history})
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    return state
+
+
+def find_final_report_candidate(run_dir: Path) -> Path | None:
+    candidates = sorted((run_dir / "reports").glob("*.pdf")) if (run_dir / "reports").exists() else []
+    if not candidates:
+        candidates = sorted(run_dir.glob("*.pdf"))
+    if candidates:
+        return candidates[0]
+    md = run_dir / "reports" / "analysis.md"
+    if md.exists():
+        return md
+    md = run_dir / "analysis.md"
+    return md if md.exists() else None
+
+
+def build_client_handoff(run_dir: Path, final_report_root: Path, service_level: str = "standard") -> dict[str, object]:
+    run_dir = run_dir.expanduser().resolve()
+    final_report_root = final_report_root.expanduser().resolve()
+    preflight_result = report_preflight(run_dir, service_level=service_level)
+    candidate = find_final_report_candidate(run_dir)
+    final_path = ""
+    if preflight_result["client_ready"] and candidate:
+        final_report_root.mkdir(parents=True, exist_ok=True)
+        suffix = candidate.suffix or ".md"
+        dest = final_report_root / f"{run_dir.name}_client_report{suffix}"
+        shutil.copy2(candidate, dest)
+        final_path = str(dest)
+        update_workflow_status(run_dir, "delivered", f"handoff built at {dest}")
+    else:
+        update_workflow_status(run_dir, "qa", "handoff blocked by report preflight")
+    handoff = {
+        "run_dir": str(run_dir),
+        "service_level": service_level_profile(service_level)["name"],
+        "client_ready": bool(preflight_result["client_ready"] and final_path),
+        "final_pdf": final_path,
+        "source_artifacts_remain_in_run_dir": str(run_dir),
+        "preflight": preflight_result,
+        "built_at": dt.datetime.now(dt.UTC).isoformat(),
+    }
+    (run_dir / "client_handoff.json").write_text(json.dumps(handoff, indent=2, sort_keys=True), encoding="utf-8")
+    return handoff
 
 
 def derive_sample_sha_from_run_dir(run_dir: Path) -> str:
@@ -1908,6 +2498,7 @@ def parse_existing_run(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.expanduser().resolve()
     if not run_dir.exists():
         raise RuntimeError(f"Run directory not found: {run_dir}")
+    update_workflow_status(run_dir, "running", "parse/report regeneration started")
     sample_sha256 = derive_sample_sha_from_run_dir(run_dir)
     sample = next(run_dir.glob("*.sample"), run_dir / "sample.unknown")
     triage: dict[str, object] = {}
@@ -1922,9 +2513,13 @@ def parse_existing_run(args: argparse.Namespace) -> int:
     elif triage:
         summary["static_iocs"] = triage.get("static_iocs", {})
     summary["yara_triage"] = run_bundled_yara_triage(run_dir, sample)
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     make_rules(run_dir, sample_sha256, summary, triage)
+    summary = generate_reporting_artifacts(args, run_dir, sample, sample_sha256, summary, triage)
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     report = write_report(args, run_dir, sample, sample_sha256, summary)
+    package_report_bundle(run_dir, report)
+    report_preflight(run_dir, service_level=getattr(args, "service_level", "standard"))
+    update_workflow_status(run_dir, "report-draft", "parse/report regeneration completed; ready for QA")
     print(report)
     return 0
 
@@ -1969,7 +2564,34 @@ def main() -> int:
     parser.add_argument("--report-only", action="store_true", help="Alias for --parse-only")
     parser.add_argument("--retriage", action="store_true", help="Re-run static triage before parsing/report generation")
     parser.add_argument("--run-dir", type=Path, help="Existing run directory for --parse-only/--report-only")
+    parser.add_argument("--service-level", choices=sorted(SERVICE_LEVEL_PROFILES), default="standard", help="Reporting service level for QA gates and handoff")
+    parser.add_argument("--report-preflight", action="store_true", help="Run report QA/preflight checks for --run-dir and exit")
+    parser.add_argument("--handoff", action="store_true", help="Build client handoff after successful report preflight for --run-dir")
+    parser.add_argument("--final-report-root", type=Path, default=Path("/home/lost0x01/RAIccoon_Reports"), help="Destination for final client-ready report copies")
+    parser.add_argument("--set-status", choices=WORKFLOW_STATUSES, help="Set workflow_status.json for --run-dir and exit")
+    parser.add_argument("--status-note", default="", help="Optional note for --set-status")
     args = parser.parse_args()
+
+    if args.report_preflight:
+        if not args.run_dir:
+            parser.error("--run-dir is required with --report-preflight")
+        result = report_preflight(args.run_dir, service_level=args.service_level)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["client_ready"] else 2
+
+    if args.handoff:
+        if not args.run_dir:
+            parser.error("--run-dir is required with --handoff")
+        result = build_client_handoff(args.run_dir, args.final_report_root, service_level=args.service_level)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["client_ready"] else 2
+
+    if args.set_status:
+        if not args.run_dir:
+            parser.error("--run-dir is required with --set-status")
+        result = update_workflow_status(args.run_dir, args.set_status, args.status_note)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
 
     if args.parse_only or args.report_only:
         if not args.run_dir:
@@ -1993,6 +2615,7 @@ def main() -> int:
         run_dir = args.run_root / f"{dt.datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{sample_sha256[:12]}"
         run_dir.mkdir(parents=True)
         assert run_dir is not None
+        update_workflow_status(run_dir, "running", "sandbox detonation started")
         current_run_dir: Path = run_dir
         shutil.copy2(sample, run_dir / f"{sample_sha256}.sample")
         preflight(args, current_run_dir)
@@ -2064,10 +2687,15 @@ def main() -> int:
             summary = parse_artifacts(current_run_dir, pcap)
             summary["static_iocs"] = triage.get("static_iocs", {})
             summary["yara_triage"] = run_bundled_yara_triage(current_run_dir, sample)
+            make_rules(current_run_dir, sample_sha256, summary, triage)
+            durable_sample = current_run_dir / f"{sample_sha256}.sample"
+            summary = generate_reporting_artifacts(args, current_run_dir, durable_sample, sample_sha256, summary, triage)
             summary_path = current_run_dir / "summary.json"
             summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-            make_rules(current_run_dir, sample_sha256, summary, triage)
-            report = write_report(args, current_run_dir, sample, sample_sha256, summary)
+            report = write_report(args, current_run_dir, durable_sample, sample_sha256, summary)
+            package_report_bundle(current_run_dir, report)
+            report_preflight(current_run_dir, service_level=args.service_level)
+            update_workflow_status(current_run_dir, "report-draft", "sandbox run completed; ready for QA")
         print(report)
         return 0
     finally:
